@@ -13,15 +13,20 @@ accompaniment tracks to estimate how often the two align harmonically.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import math
 import random
+import re
 import sys
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+import os
+import shutil
+import tempfile
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pretty_midi
@@ -32,6 +37,8 @@ LOGGER = logging.getLogger(__name__)
 
 
 POLYDIS_CACHE: dict[Path, dict] = {}
+
+_ACCOMPANIMENT_TRACK_NAMES = {"piano"}
 
 
 @dataclass
@@ -116,6 +123,39 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Optional root directory of the PolyDis codebase (expects poly_dis/model_param/polydis-v1.pt) to enable latent similarity metrics.",
+    )
+    parser.add_argument(
+        "--frechet-music-distance",
+        action="store_true",
+        help="Compute Frechet Music Distance (FMD) between generated accompaniment and ground-truth accompaniment.",
+    )
+    parser.add_argument(
+        "--frechet-model",
+        default="clamp2",
+        choices=("clamp2", "clamp"),
+        help="Embedding model used for Frechet Music Distance (default: clamp2).",
+    )
+    parser.add_argument(
+        "--frechet-estimator",
+        default="mle",
+        choices=("mle", "bootstrap", "oas", "shrinkage", "leodit_wolf"),
+        help="Gaussian estimator used for Frechet Music Distance (default: mle).",
+    )
+    parser.add_argument(
+        "--frechet-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for caching Frechet Music Distance features.",
+    )
+    parser.add_argument(
+        "--frechet-verbose",
+        action="store_true",
+        help="Enable verbose logging from Frechet Music Distance feature extractor.",
+    )
+    parser.add_argument(
+        "--frechet-keep-temp",
+        action="store_true",
+        help="Keep temporary accompaniment-only MIDI files prepared for Frechet Music Distance.",
     )
     parser.add_argument(
         "--melody-track-names",
@@ -920,14 +960,10 @@ def _summarize_pair_differences(
     for first, second in pairs:
         rd_diffs.append(abs(first.rhythm_density - second.rhythm_density))
         vn_diffs.append(abs(first.voice_number - second.voice_number))
-    rd_arr = np.asarray(rd_diffs, dtype=np.float64)
-    vn_arr = np.asarray(vn_diffs, dtype=np.float64)
     return {
         "count": len(pairs),
-        "rd_mean_diff": float(rd_arr.mean()),
-        "rd_std_diff": float(rd_arr.std()),
-        "vn_mean_diff": float(vn_arr.mean()),
-        "vn_std_diff": float(vn_arr.std()),
+        "rd": _five_number_summary(rd_diffs),
+        "vn": _five_number_summary(vn_diffs),
     }
 
 
@@ -1003,11 +1039,32 @@ def _load_midi(path: Path) -> pretty_midi.PrettyMIDI:
         raise RuntimeError(f"Failed to load MIDI file: {path}") from exc
 
 
+_MIDI_SUFFIX_PATTERN = re.compile(r"\.mid(?:i)?", re.IGNORECASE)
+
+
+def _normalized_stem(path: Path) -> str:
+    """Return the basename without any suffixes appended after the first MIDI extension."""
+    name = path.name
+    match = _MIDI_SUFFIX_PATTERN.search(name)
+    if match:
+        return name[: match.start()]
+    return path.stem
+
+
 def _match_ground_truth(generated_dir: Path, groundtruth_dir: Path) -> List[tuple[Path, Path]]:
-    gt_map = {path.stem: path for path in groundtruth_dir.glob("*.mid*")}
+    gt_map: dict[str, Path] = {}
+    for gt_path in groundtruth_dir.glob("*.mid*"):
+        key = _normalized_stem(gt_path)
+        if key in gt_map:
+            LOGGER.warning(
+                "Multiple ground truth files map to key %s; keeping %s", key, gt_map[key].name
+            )
+            continue
+        gt_map[key] = gt_path
     pairs: List[tuple[Path, Path]] = []
     for gen_path in sorted(generated_dir.glob("*.mid*")):
-        match = gt_map.get(gen_path.stem)
+        key = _normalized_stem(gen_path)
+        match = gt_map.get(key)
         if match is None:
             LOGGER.warning("No ground truth found for %s", gen_path.name)
             continue
@@ -1015,11 +1072,260 @@ def _match_ground_truth(generated_dir: Path, groundtruth_dir: Path) -> List[tupl
     return pairs
 
 
-def _summarize(values: Iterable[float]) -> Optional[float]:
-    filtered = [val for val in values if val is not None and not np.isnan(val)]
-    if not filtered:
+def _build_accompaniment_only_midi(
+    midi: pretty_midi.PrettyMIDI,
+    melody_names: Iterable[str],
+    melody_programs: Iterable[int],
+    melody_indices: Iterable[int],
+    keep_melody: bool,
+    include_drums: bool,
+) -> pretty_midi.PrettyMIDI:
+    """Return a deep-copied MIDI with melody (and optionally drums) removed."""
+    midi_copy = copy.deepcopy(midi)
+    if keep_melody:
+        if include_drums:
+            return midi_copy
+        midi_copy.instruments = [instrument for instrument in midi_copy.instruments if not instrument.is_drum]
+        return midi_copy
+
+    melody_name_set = {name.lower() for name in melody_names if name}
+    melody_program_set = set(melody_programs)
+    melody_index_set = set(melody_indices)
+
+    filtered: List[pretty_midi.Instrument] = []
+    for idx, instrument in enumerate(midi_copy.instruments):
+        if not include_drums and instrument.is_drum:
+            continue
+        name = (instrument.name or "").strip().lower()
+        is_melody = False
+        if melody_name_set and name and name in melody_name_set:
+            is_melody = True
+        if melody_program_set and instrument.program in melody_program_set:
+            is_melody = True
+        if melody_index_set and idx in melody_index_set:
+            is_melody = True
+        if not is_melody:
+            filtered.append(instrument)
+    midi_copy.instruments = filtered
+    return midi_copy
+
+
+def _build_ground_truth_accompaniment_midi(
+    midi: pretty_midi.PrettyMIDI,
+    include_drums: bool,
+) -> pretty_midi.PrettyMIDI:
+    """Return a deep-copied MIDI keeping only the accompaniment instruments."""
+    midi_copy = copy.deepcopy(midi)
+    selected, _ = _select_ground_truth_instruments(midi_copy, include_drums)
+    midi_copy.instruments = selected
+    return midi_copy
+
+
+def _is_accompaniment_instrument(instrument: pretty_midi.Instrument) -> bool:
+    name = (instrument.name or "").strip().lower()
+    return name in _ACCOMPANIMENT_TRACK_NAMES
+
+
+def _select_ground_truth_instruments(
+    midi: pretty_midi.PrettyMIDI,
+    include_drums: bool,
+) -> Tuple[List[pretty_midi.Instrument], bool]:
+    available = [inst for inst in midi.instruments if include_drums or not inst.is_drum]
+    piano_tracks = [inst for inst in available if _is_accompaniment_instrument(inst)]
+    if piano_tracks:
+        return piano_tracks, True
+    return available, False
+
+
+def _collect_ground_truth_accompaniment_notes(
+    midi: pretty_midi.PrettyMIDI,
+    include_drums: bool,
+    piece_label: Optional[str] = None,
+) -> List[pretty_midi.Note]:
+    instruments, used_named_track = _select_ground_truth_instruments(midi, include_drums)
+    if not instruments:
+        if piece_label:
+            LOGGER.warning("No usable instruments found in ground truth %s", piece_label)
+        return []
+    if not used_named_track and piece_label:
+        LOGGER.warning(
+            "Ground truth %s is missing a Piano track; using %d fallback instrument(s).",
+            piece_label,
+            len(instruments),
+        )
+    notes: List[pretty_midi.Note] = []
+    for instrument in instruments:
+        notes.extend(instrument.notes)
+    return notes
+
+
+_PROMPT_DIR_PATTERN = re.compile(r"^prompt(\d+)$", re.IGNORECASE)
+
+
+def _infer_prompt_accompaniment_path(
+    generated_path: Path,
+    groundtruth_path: Path,
+) -> Optional[Path]:
+    """Return the prompt accompaniment path inferred from directory naming conventions."""
+    for parent in generated_path.parents:
+        match = _PROMPT_DIR_PATTERN.match(parent.name)
+        if not match:
+            continue
+        prompt_len = match.group(1)
+        name_variants: set[str] = {groundtruth_path.name}
+        stem = groundtruth_path.stem
+        if stem:
+            name_variants.add(stem)
+        trimmed = stem
+        while trimmed and trimmed.endswith(".mid"):
+            trimmed = trimmed[:-4]
+            if trimmed:
+                name_variants.add(trimmed)
+        candidate_names = [f"{variant}_promptlen{prompt_len}.mid" for variant in name_variants]
+
+        search_roots: set[Path] = set()
+        current = parent
+        for _ in range(4):
+            search_roots.add(current)
+            if current == current.parent:
+                break
+            current = current.parent
+
+        for root in search_roots:
+            for candidate_name in candidate_names:
+                candidate = root / candidate_name
+                if candidate.exists():
+                    return candidate
+    return None
+
+
+class _FrechetDatasetBuilder:
+    """Prepare accompaniment-only datasets for Frechet Music Distance computation."""
+
+    def __init__(self, root: Path, args: argparse.Namespace) -> None:
+        self.root = root
+        self.generated_dir = root / "generated"
+        self.groundtruth_dir = root / "groundtruth"
+        self.generated_dir.mkdir(parents=True, exist_ok=True)
+        self.groundtruth_dir.mkdir(parents=True, exist_ok=True)
+        self._args = args
+        self._stems: set[str] = set()
+
+    def add_pair(
+        self,
+        generated_path: Path,
+        generated_midi: pretty_midi.PrettyMIDI,
+        groundtruth_path: Path,
+        ground_truth_midi: pretty_midi.PrettyMIDI,
+    ) -> tuple[Path, Path]:
+        stem = generated_path.stem
+        if stem in self._stems:
+            raise ValueError(f"Duplicate stem encountered while preparing FMD dataset: {stem}")
+
+        generated_accompaniment = _build_accompaniment_only_midi(
+            generated_midi,
+            self._args.melody_track_names,
+            self._args.melody_programs,
+            self._args.melody_track_indices,
+            self._args.keep_melody,
+            self._args.include_drums,
+        )
+        generated_dest = self.generated_dir / f"{stem}.mid"
+        generated_accompaniment.write(str(generated_dest))
+
+        groundtruth_accompaniment = _build_ground_truth_accompaniment_midi(
+            ground_truth_midi,
+            self._args.include_drums,
+        )
+        groundtruth_dest = self.groundtruth_dir / f"{stem}.mid"
+        groundtruth_accompaniment.write(str(groundtruth_dest))
+
+        self._stems.add(stem)
+        return generated_dest, groundtruth_dest
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+def _compute_frechet_music_distance_dataset(
+    reference_dir: Path,
+    test_dir: Path,
+    model_name: str,
+    estimator_name: str,
+    verbose: bool,
+    cache_dir: Optional[Path],
+) -> Optional[float]:
+    """Compute Frechet Music Distance between two prepared accompaniment datasets."""
+    if not reference_dir.exists() or not test_dir.exists():
+        LOGGER.warning("FMD dataset directories missing; skipping FMD computation.")
         return None
-    return float(np.mean(filtered))
+    if not any(reference_dir.iterdir()) or not any(test_dir.iterdir()):
+        LOGGER.warning("FMD dataset directories are empty; skipping FMD computation.")
+        return None
+
+    home_override = Path.cwd()
+    original_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(home_override)
+    try:
+        try:
+            from frechet_music_distance import FrechetMusicDistance  # type: ignore
+            from frechet_music_distance import memory as fmd_memory  # type: ignore
+        except ImportError:
+            LOGGER.error(
+                "frechet-music-distance package not available. Install it with 'pip install frechet-music-distance'."
+            )
+            return None
+    finally:
+        if original_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = original_home
+
+    target_cache = cache_dir or (home_override / ".cache" / "frechet_music_distance" / "precomputed")
+    target_cache = target_cache.resolve()
+    target_cache.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from joblib import Memory
+
+        fmd_memory.MEMORY = Memory(str(target_cache), verbose=0)
+        metric = FrechetMusicDistance(
+            feature_extractor=model_name,
+            gaussian_estimator=estimator_name,
+            verbose=verbose,
+        )
+        score = metric.score(str(reference_dir), str(test_dir))
+    except Exception as exc:  # pragma: no cover - depends on external package/runtime
+        LOGGER.error("Failed to compute Frechet Music Distance: %s", exc)
+        return None
+
+    return float(score)
+
+
+def _five_number_summary(values: Iterable[Optional[float]]) -> Optional[dict]:
+    numeric_values: List[float] = []
+    for val in values:
+        if val is None:
+            continue
+        try:
+            numeric = float(val)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(numeric):
+            continue
+        numeric_values.append(numeric)
+    if not numeric_values:
+        return None
+    arr = np.asarray(numeric_values, dtype=np.float64)
+    return {
+        "mean": float(arr.mean()),
+        "min": float(arr.min()),
+        "q1": float(np.quantile(arr, 0.25)),
+        "median": float(np.quantile(arr, 0.5)),
+        "q3": float(np.quantile(arr, 0.75)),
+        "max": float(arr.max()),
+        "count": int(arr.size),
+    }
 
 
 def _format_optional(value: Optional[float], precision: int = 4) -> str:
@@ -1034,13 +1340,85 @@ def _format_optional(value: Optional[float], precision: int = 4) -> str:
     return f"{numeric:.{precision}f}"
 
 
+def _is_stat_dict(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = {"mean", "min", "q1", "median", "q3", "max"}
+    return required.issubset(value.keys())
+
+
+def _print_summary_block(label: str, summary: Optional[object], fmt: callable) -> None:
+    if summary is None:
+        print(f"  {label}: n/a")
+        return
+    if _is_stat_dict(summary):
+        print(f"  {label}:")
+        count = summary.get("count")
+        if count is not None:
+            print(f"    count: {count}")
+        print(f"    mean: {fmt(summary.get('mean'))}")
+        print(f"    min: {fmt(summary.get('min'))}")
+        print(f"    q1: {fmt(summary.get('q1'))}")
+        print(f"    median: {fmt(summary.get('median'))}")
+        print(f"    q3: {fmt(summary.get('q3'))}")
+        print(f"    max: {fmt(summary.get('max'))}")
+        return
+    if isinstance(summary, dict):
+        print(f"  {label}:")
+        for key, value in summary.items():
+            pretty = key.replace("_", " ")
+            if _is_stat_dict(value):
+                print(f"    {pretty}:")
+                count = value.get("count")
+                if count is not None:
+                    print(f"      count: {count}")
+                print(f"      mean: {fmt(value.get('mean'))}")
+                print(f"      min: {fmt(value.get('min'))}")
+                print(f"      q1: {fmt(value.get('q1'))}")
+                print(f"      median: {fmt(value.get('median'))}")
+                print(f"      q3: {fmt(value.get('q3'))}")
+                print(f"      max: {fmt(value.get('max'))}")
+            else:
+                print(f"    {pretty}: {value if value is not None else 'n/a'}")
+        return
+    if isinstance(summary, (int, float)):
+        print(f"  {label}: {fmt(summary)}")
+        return
+    print(f"  {label}: {summary}")
+
+
 def evaluate_pair(
     generated_path: Path,
     groundtruth_path: Path,
     args: argparse.Namespace,
+    frechet_builder: Optional[_FrechetDatasetBuilder] = None,
+    prompt_path: Optional[Path] = None,
 ) -> dict:
     generated_midi = _load_midi(generated_path)
     ground_truth_midi = _load_midi(groundtruth_path)
+
+    prompt_midi: Optional[pretty_midi.PrettyMIDI] = None
+    prompt_notes: List[pretty_midi.Note] = []
+    prompt_continuation_notes: List[pretty_midi.Note] = []
+    generated_continuation_notes: List[pretty_midi.Note] = []
+    prompt_end_time: Optional[float] = None
+    if prompt_path is not None:
+        try:
+            prompt_midi = _load_midi(prompt_path)
+        except Exception as exc:  # pragma: no cover - best effort logging
+            LOGGER.warning("Failed to load prompt accompaniment for %s: %s", generated_path.name, exc)
+        else:
+            prompt_notes = _collect_accompaniment_notes(
+                prompt_midi,
+                args.melody_track_names,
+                args.melody_programs,
+                args.melody_track_indices,
+                args.keep_melody,
+                args.include_drums,
+            )
+            end_candidate = float(prompt_midi.get_end_time())
+            if end_candidate > 0:
+                prompt_end_time = end_candidate
 
     generated_notes = _collect_accompaniment_notes(
         generated_midi,
@@ -1057,14 +1435,43 @@ def evaluate_pair(
         args.melody_track_indices,
         args.include_drums,
     )
-    ground_truth_notes = _collect_accompaniment_notes(
+    ground_truth_notes = _collect_ground_truth_accompaniment_notes(
         ground_truth_midi,
-        (),
-        (),
-        (),
-        True,
         args.include_drums,
+        groundtruth_path.stem,
     )
+
+    if prompt_end_time is not None:
+        if ground_truth_notes:
+            for note in ground_truth_notes:
+                if note.end <= prompt_end_time:
+                    continue
+                clipped_start = max(note.start, prompt_end_time)
+                if clipped_start >= note.end:
+                    continue
+                prompt_continuation_notes.append(
+                    pretty_midi.Note(
+                        velocity=note.velocity,
+                        pitch=note.pitch,
+                        start=clipped_start,
+                        end=note.end,
+                    )
+                )
+        if generated_notes:
+            for note in generated_notes:
+                if note.end <= prompt_end_time:
+                    continue
+                clipped_start = max(note.start, prompt_end_time)
+                if clipped_start >= note.end:
+                    continue
+                generated_continuation_notes.append(
+                    pretty_midi.Note(
+                        velocity=note.velocity,
+                        pitch=note.pitch,
+                        start=clipped_start,
+                        end=note.end,
+                    )
+                )
 
     if not generated_notes:
         LOGGER.warning("No accompaniment notes extracted from generated file %s", generated_path.name)
@@ -1072,6 +1479,8 @@ def evaluate_pair(
         LOGGER.warning("No melody notes extracted from generated file %s", generated_path.name)
     if not ground_truth_notes:
         LOGGER.warning("No notes found in ground truth file %s", groundtruth_path.name)
+    if prompt_path is not None and not prompt_notes:
+        LOGGER.warning("No accompaniment notes extracted from prompt file %s", prompt_path.name)
 
     config, piece_length = _determine_distribution_bins(
         generated_notes,
@@ -1093,13 +1502,52 @@ def evaluate_pair(
         generated_notes,
         args.chord_annotation_root,
     )
-    polydis_similarity = _compute_polydis_latent_similarity(
-        generated_midi,
-        generated_notes,
-        ground_truth_midi,
-        ground_truth_notes,
-        args.polydis_root,
-    )
+    prompt_polydis = None
+    prompt_generated_continuation_polydis = None
+    prompt_groundtruth_continuation_polydis = None
+    if args.polydis_root is not None:
+        if prompt_midi is None:
+            if prompt_path is not None:
+                LOGGER.warning("Skipping PolyDis metric for %s due to prompt load failure.", generated_path.name)
+            else:
+                LOGGER.warning("Prompt accompaniment missing for %s; skipping PolyDis metric.", generated_path.name)
+        elif not generated_notes or not prompt_notes:
+            LOGGER.warning("Insufficient notes for PolyDis metric in %s", generated_path.name)
+        else:
+            prompt_polydis = _compute_polydis_latent_similarity(
+                generated_midi,
+                generated_notes,
+                prompt_midi,
+                prompt_notes,
+                args.polydis_root,
+            )
+            if generated_continuation_notes:
+                prompt_generated_continuation_polydis = _compute_polydis_latent_similarity(
+                    generated_midi,
+                    generated_continuation_notes,
+                    prompt_midi,
+                    prompt_notes,
+                    args.polydis_root,
+                )
+            elif prompt_end_time is not None:
+                LOGGER.warning(
+                    "No generated continuation notes available past prompt for %s; skipping prompt-generated PolyDis.",
+                    generated_path.name,
+                )
+
+            if prompt_continuation_notes:
+                prompt_groundtruth_continuation_polydis = _compute_polydis_latent_similarity(
+                    prompt_midi,
+                    prompt_notes,
+                    ground_truth_midi,
+                    prompt_continuation_notes,
+                    args.polydis_root,
+                )
+            elif prompt_end_time is not None:
+                LOGGER.warning(
+                    "No ground-truth continuation notes available past prompt for %s; skipping prompt-ground-truth PolyDis.",
+                    generated_path.name,
+                )
 
     auto_phrase_metrics = None
     if args.auto_phrase_analysis:
@@ -1122,10 +1570,22 @@ def evaluate_pair(
             "ground_truth": [asdict(metric) for metric in ground_phrase_metrics],
         }
 
+    if frechet_builder is not None:
+        try:
+            frechet_builder.add_pair(
+                generated_path,
+                generated_midi,
+                groundtruth_path,
+                ground_truth_midi,
+            )
+        except Exception as exc:  # pragma: no cover - best effort logging
+            LOGGER.warning("Failed to prepare Frechet dataset for %s: %s", generated_path.name, exc)
+
     return {
         "piece": generated_path.stem,
         "generated_path": str(generated_path),
         "groundtruth_path": str(groundtruth_path),
+        "prompt_path": str(prompt_path) if prompt_path is not None else None,
         "note_counts": {
             "generated": len(generated_notes),
             "ground_truth": len(ground_truth_notes),
@@ -1135,7 +1595,9 @@ def evaluate_pair(
         "duration_jsd": _js_divergence(duration_generated, duration_ground_truth),
         "harmonicity": harmonicity,
         "chord_accuracy": chord_accuracy,
-        "polydis": polydis_similarity,
+        "prompt_polydis": prompt_polydis,
+        "prompt_generated_continuation_polydis": prompt_generated_continuation_polydis,
+        "prompt_groundtruth_continuation_polydis": prompt_groundtruth_continuation_polydis,
         "auto_phrase_metrics": auto_phrase_metrics,
         "histograms": {
             "pitch_generated": pitch_generated.tolist(),
@@ -1168,17 +1630,44 @@ def main() -> None:
         LOGGER.error("No matching MIDI pairs found.")
         return
 
-    results = [evaluate_pair(gen_path, gt_path, args) for gen_path, gt_path in pairs]
+    frechet_builder: Optional[_FrechetDatasetBuilder] = None
+    frechet_temp_root: Optional[Path] = None
+    if args.frechet_music_distance:
+        try:
+            frechet_temp_root = Path(
+                tempfile.mkdtemp(prefix="fmd_", dir=str(Path.cwd()))
+            )
+            frechet_builder = _FrechetDatasetBuilder(frechet_temp_root, args)
+        except Exception as exc:  # pragma: no cover - filesystem/environment dependent
+            LOGGER.error("Failed to prepare Frechet Music Distance workspace: %s", exc)
+            frechet_builder = None
+            if frechet_temp_root is not None:
+                shutil.rmtree(frechet_temp_root, ignore_errors=True)
 
-    pitch_jsd = _summarize(result["pitch_jsd"] for result in results)
-    onset_jsd = _summarize(result["onset_jsd"] for result in results)
-    duration_jsd = _summarize(result["duration_jsd"] for result in results)
+    results: List[dict] = []
+    for gen_path, gt_path in pairs:
+        prompt_path = _infer_prompt_accompaniment_path(gen_path, gt_path)
+        results.append(
+            evaluate_pair(
+                gen_path,
+                gt_path,
+                args,
+                frechet_builder=frechet_builder,
+                prompt_path=prompt_path,
+            )
+        )
+
+    pitch_jsd = _five_number_summary(result["pitch_jsd"] for result in results)
+    onset_jsd = _five_number_summary(result["onset_jsd"] for result in results)
+    duration_jsd = _five_number_summary(result["duration_jsd"] for result in results)
     harmonic_values = [result["harmonicity"] for result in results if result["harmonicity"]]
-    harmonic_summary = None
+    harmonic_summary: Optional[dict] = None
     if harmonic_values:
+        harmonic_summary = {}
         keys = harmonic_values[0].keys()
-        harmonic_summary = {key: float(np.mean([item[key] for item in harmonic_values])) for key in keys}
-    chord_accuracy_mean = _summarize(result.get("chord_accuracy") for result in results)
+        for key in keys:
+            harmonic_summary[key] = _five_number_summary(item.get(key) for item in harmonic_values)
+    chord_accuracy_summary = _five_number_summary(result.get("chord_accuracy") for result in results)
     phrase_pair_summary = None
     if args.validation_phrases is not None:
         phrase_groups = _load_phrase_metrics(
@@ -1202,33 +1691,75 @@ def main() -> None:
                 rd_diffs.append(abs(float(gen["rhythm_density"]) - float(gt["rhythm_density"])) )
                 vn_diffs.append(abs(float(gen["voice_number"]) - float(gt["voice_number"])) )
         if rd_diffs and vn_diffs:
-            rd_arr = np.asarray(rd_diffs, dtype=np.float64)
-            vn_arr = np.asarray(vn_diffs, dtype=np.float64)
             auto_phrase_summary = {
                 "count": len(rd_diffs),
-                "rd_mean_diff": float(rd_arr.mean()),
-                "rd_std_diff": float(rd_arr.std()),
-                "vn_mean_diff": float(vn_arr.mean()),
-                "vn_std_diff": float(vn_arr.std()),
+                "rd": _five_number_summary(rd_diffs),
+                "vn": _five_number_summary(vn_diffs),
             }
-    polydis_summary = None
+    prompt_polydis_summary = None
+    prompt_generated_continuation_polydis_summary = None
+    prompt_groundtruth_continuation_polydis_summary = None
     if args.polydis_root is not None:
-        polydis_values = [result.get("polydis") for result in results if result.get("polydis")]
-        if polydis_values:
-            txt_means = [val.get("txt_mean_distance") for val in polydis_values if val.get("txt_mean_distance") is not None]
-            chd_means = [val.get("chd_mean_distance") for val in polydis_values if val.get("chd_mean_distance") is not None]
-            total_segments = sum(val.get("segments", 0) or 0 for val in polydis_values)
-            polydis_summary = {
-                "txt_mean_distance": float(np.mean(txt_means)) if txt_means else None,
-                "chd_mean_distance": float(np.mean(chd_means)) if chd_means else None,
-                "segments": int(total_segments) if total_segments else None,
+        prompt_polydis_values = [result.get("prompt_polydis") for result in results if result.get("prompt_polydis")]
+        if prompt_polydis_values:
+            prompt_polydis_summary = {
+                "txt_mean_distance": _five_number_summary(val.get("txt_mean_distance") for val in prompt_polydis_values),
+                "chd_mean_distance": _five_number_summary(val.get("chd_mean_distance") for val in prompt_polydis_values),
+                "segments": _five_number_summary(val.get("segments") for val in prompt_polydis_values),
             }
+
+        generated_values = [
+            result.get("prompt_generated_continuation_polydis")
+            for result in results
+            if result.get("prompt_generated_continuation_polydis")
+        ]
+        if generated_values:
+            prompt_generated_continuation_polydis_summary = {
+                "txt_mean_distance": _five_number_summary(val.get("txt_mean_distance") for val in generated_values),
+                "chd_mean_distance": _five_number_summary(val.get("chd_mean_distance") for val in generated_values),
+                "segments": _five_number_summary(val.get("segments") for val in generated_values),
+            }
+
+        groundtruth_values = [
+            result.get("prompt_groundtruth_continuation_polydis")
+            for result in results
+            if result.get("prompt_groundtruth_continuation_polydis")
+        ]
+        if groundtruth_values:
+            prompt_groundtruth_continuation_polydis_summary = {
+                "txt_mean_distance": _five_number_summary(val.get("txt_mean_distance") for val in groundtruth_values),
+                "chd_mean_distance": _five_number_summary(val.get("chd_mean_distance") for val in groundtruth_values),
+                "segments": _five_number_summary(val.get("segments") for val in groundtruth_values),
+            }
+
+    frechet_score = None
+    if frechet_builder is not None:
+        frechet_score = _compute_frechet_music_distance_dataset(
+            frechet_builder.groundtruth_dir,
+            frechet_builder.generated_dir,
+            args.frechet_model,
+            args.frechet_estimator,
+            args.frechet_verbose,
+            args.frechet_cache_dir,
+        )
+        if args.frechet_keep_temp:
+            LOGGER.info(
+                "Frechet Music Distance temporary data preserved at %s",
+                frechet_builder.root,
+            )
+        else:
+            frechet_builder.cleanup()
+    elif args.frechet_music_distance:
+        LOGGER.warning("Frechet Music Distance was requested but could not be prepared.")
 
     accompaniment_vs_gt_summary = {
         "pitch_jsd": pitch_jsd,
         "onset_jsd": onset_jsd,
         "duration_jsd": duration_jsd,
-        "polydis": polydis_summary,
+        "prompt_polydis": prompt_polydis_summary,
+        "prompt_generated_continuation_polydis": prompt_generated_continuation_polydis_summary,
+        "prompt_groundtruth_continuation_polydis": prompt_groundtruth_continuation_polydis_summary,
+        "frechet_music_distance": frechet_score,
     }
 
     inter_track_continuity_summary = {
@@ -1238,7 +1769,7 @@ def main() -> None:
 
     melody_relationship_summary = {
         "harmonicity": harmonic_summary,
-        "chord_accuracy": chord_accuracy_mean,
+        "chord_accuracy": chord_accuracy_summary,
     }
 
     fmt = _format_optional
@@ -1246,63 +1777,41 @@ def main() -> None:
     print(f"Pairs evaluated: {len(results)}")
 
     print("Accompaniment vs Ground Truth:")
-    print(f"  Pitch JSD: {fmt(accompaniment_vs_gt_summary['pitch_jsd'])}")
-    print(f"  Onset JSD: {fmt(accompaniment_vs_gt_summary['onset_jsd'])}")
-    print(f"  Duration JSD: {fmt(accompaniment_vs_gt_summary['duration_jsd'])}")
-    poly_summary = accompaniment_vs_gt_summary.get("polydis")
-    if poly_summary:
-        print(
-            "  PolyDis txt_mean:"
-            f" {fmt(poly_summary.get('txt_mean_distance'))}"
-        )
-        print(
-            "  PolyDis chd_mean:"
-            f" {fmt(poly_summary.get('chd_mean_distance'))}"
-        )
-        segments = poly_summary.get("segments")
-        print(f"  PolyDis segments: {segments if segments is not None else 'n/a'}")
-    elif args.polydis_root is not None:
-        print("  PolyDis latent distance: n/a")
+    _print_summary_block("Pitch JSD", accompaniment_vs_gt_summary.get("pitch_jsd"), fmt)
+    _print_summary_block("Onset JSD", accompaniment_vs_gt_summary.get("onset_jsd"), fmt)
+    _print_summary_block("Duration JSD", accompaniment_vs_gt_summary.get("duration_jsd"), fmt)
+    _print_summary_block("Frechet Music Distance", accompaniment_vs_gt_summary.get("frechet_music_distance"), fmt)
+    _print_summary_block("PolyDis (prompt)", accompaniment_vs_gt_summary.get("prompt_polydis"), fmt)
+    _print_summary_block(
+        "PolyDis (prompt vs generated continuation)",
+        accompaniment_vs_gt_summary.get("prompt_generated_continuation_polydis"),
+        fmt,
+    )
+    _print_summary_block(
+        "PolyDis (prompt vs ground truth continuation)",
+        accompaniment_vs_gt_summary.get("prompt_groundtruth_continuation_polydis"),
+        fmt,
+    )
 
     print()
     print("Accompaniment Inter-Track Continuity:")
-
-    def _print_pair_stats(label: str, stats: Optional[dict]) -> None:
-        if not stats:
-            print(f"  {label}: n/a")
-            return
-        rd_mean = fmt(stats.get("rd_mean_diff"))
-        vn_mean = fmt(stats.get("vn_mean_diff"))
-        rd_std = stats.get("rd_std_diff")
-        vn_std = stats.get("vn_std_diff")
-        rd_part = rd_mean if rd_std is None else f"{rd_mean} (±{fmt(rd_std)})"
-        vn_part = vn_mean if vn_std is None else f"{vn_mean} (±{fmt(vn_std)})"
-        count = stats.get("count", "n/a")
-        print(f"  {label}: RD diff={rd_part}, VN diff={vn_part}, n={count}")
-
     validation_pairs = inter_track_continuity_summary.get("validation_pairs")
     if validation_pairs:
         for label, key in (("Random", "random"), ("Same Song", "same_song"), ("Adjacent", "adjacent")):
-            _print_pair_stats(label, validation_pairs.get(key))
+            _print_summary_block(f"Validation {label}", validation_pairs.get(key), fmt)
     else:
         print("  Validation phrase pairs: n/a")
 
     auto_pairs = inter_track_continuity_summary.get("auto_phrase_pairs")
     if auto_pairs:
-        _print_pair_stats("Auto phrase (gen vs gt)", auto_pairs)
+        _print_summary_block("Auto phrase (gen vs gt)", auto_pairs, fmt)
     elif args.auto_phrase_analysis:
         print("  Auto phrase (gen vs gt): n/a")
 
     print()
-    print("Accompaniment <-> Melody:")
-    harmonicity = melody_relationship_summary.get("harmonicity")
-    if harmonicity:
-        print(f"  Harmonic consonant ratio: {fmt(harmonicity.get('consonant_ratio'))}")
-        print(f"  Harmonic dissonant ratio: {fmt(harmonicity.get('dissonant_ratio'))}")
-        print(f"  Harmonic unsupported ratio: {fmt(harmonicity.get('unsupported_ratio'))}")
-    else:
-        print("  Harmonic consonance: n/a")
-    print(f"  Chord accuracy: {fmt(melody_relationship_summary.get('chord_accuracy'))}")
+    print("Accompaniment ↔ Melody:")
+    _print_summary_block("Harmonicity", melody_relationship_summary.get("harmonicity"), fmt)
+    _print_summary_block("Chord Accuracy", melody_relationship_summary.get("chord_accuracy"), fmt)
 
     if args.output_json:
         payload = {

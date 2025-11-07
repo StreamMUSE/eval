@@ -1,202 +1,130 @@
-# Accompaniment Evaluation Script
+# Evaluation Toolkit
 
-Utilities for benchmarking generated accompaniment MIDI against ground‑truth accompaniments. The CLI computes distributional divergences, latent distances (PolyDis), harmonic alignment, and phrase‑level continuity metrics, then presents the results in grouped summaries and machine‑readable JSON.
+Utilities in this directory evaluate melody-conditioned accompaniment runs and
+summarise the results for plotting. All examples assume you are running from
+the repository root (`StreamMUSE/`).
 
----
+## Contents
+- `evaluate_accompaniment_metrics.py` – score a single run by comparing
+  generated MIDI files against ground-truth accompaniment.
+- `batch_evaluate_accompaniment_metrics.sh` – loop the evaluator over many
+  prompt folders and collate summaries into a CSV. It automatically discovers
+  `promptXX` subdirectories and forwards evaluator flags (details below).
+- `batch_runs.conf` – example configuration consumed by the batch script.
+- `plot_music_quality.py` – produce the standard music-quality plots from the
+  aggregated CSV output.
+- `run_prompt_polydis_eval.sh` – helper for quickly scoring a single `promptXX`
+  directory with PolyDis, FMD, auto-phrase analysis, and guitar-track removal
+  enabled out of the box.
 
-## Requirements
+## The eval script
+1. Gather two directories that share MIDI basenames:
+   - `GEN_DIR`: generated outputs (melody + accompaniment). Melody tracks are
+     removed automatically unless you pass `--keep-melody`.
+   - `GT_DIR`: ground-truth accompaniment.
+2. Launch the evaluator:
+   ```bash
+   python eval/evaluate_accompaniment_metrics.py \
+       --generated-dir "$GEN_DIR" \
+       --groundtruth-dir "$GT_DIR" \
+       --output-json results/single_run_metrics.json \
+       --frechet-music-distance \
+       --polydis-root /path/to/icm-deep-music-generation
+   ```
 
-- Python 3.9+
-- Python packages (see `requirements.txt`): `numpy`, `pretty_midi`, `mir_eval`, `torch`, `scipy`, `tqdm` *(optional)*
-- For PolyDis latent metrics, clone the [`icm-deep-music-generation`](https://github.com/YatingMusic/icm-deep-music-generation) repo (or vendor the `poly_dis` package) and place the checkpoint at `poly_dis/model_param/polydis-v1.pt`.
+Key switches:
+- `--frechet-music-distance` enables FMD (add `--frechet-cache-dir` to reuse
+  embeddings). Omit the flag to save time.
+- `--polydis-root` points at the PolyDis repo (clone
+  `https://github.com/ZZWaang/icm-deep-music-generation.git` and use that path)
+  when latent texture metrics are desired. Skip it if PolyDis is unnecessary or
+  already cached.
+- `--auto-phrase-analysis` segments the MIDI into fixed-bar windows for
+  rhythm-density/voice-number checks when no validation phrases are supplied.
 
-Install dependencies:
+The script prints per-run statistics to stdout and, if `--output-json` is set,
+writes detailed per-piece results for later inspection.
 
-```bash
-pip install -r requirements.txt
-```
-
-CPU-only environments work, though PyTorch may emit CUDA warnings.
-
----
-
-## Expected Inputs
-
-- `--generated-dir`: MIDI files containing melody+accompaniment. Melody tracks can be filtered using name/program/index flags.
-- `--groundtruth-dir`: MIDI files with ground-truth accompaniments (paired to generated files by filename stem).
-- Optional validation phrases (`--validation-phrases`): JSONL with events for custom RD/VN checks.
-- Optional automatic phrase analysis (`--auto-phrase-analysis`): segments each MIDI into fixed-length bar windows (default 4 bars) for RD/VN continuity.
-- PolyDis metrics require `--polydis-root` pointing to the PolyDis codebase.
-
-### PolyDis Setup
-
-This repository does **not** ship the PolyDis sources or weights. To enable latent-distance metrics:
-
-```bash
-cd <workspace>
-git clone https://github.com/YatingMusic/icm-deep-music-generation.git
-```
-
-After cloning, open `poly_dis/model_param/gdrive_link.txt` for the official download URL, retrieve `polydis-v1.pt`, and place it under `poly_dis/model_param/`, replacing the placeholder link file if present. When running the evaluator, point `--polydis-root` to the clone:
-
-```bash
-python scripts/evaluate_accompaniment_metrics.py \
-  ... \
-  --polydis-root /path/to/icm-deep-music-generation
-```
-
-### Directory Layout
-
-```
-<workspace>/
-  generated/
-    001.mid        # melody + accompaniment tracks
-    002.mid
-    ...
-  groundtruth/
-    001.mid        # accompaniment-only tracks
-    002.mid
-    ...
-```
-
-File stems must match between `generated/` and `groundtruth/` (e.g., `001.mid` in both). Inside each generated MIDI, label the melody track(s) clearly (e.g., instrument name `melody`) and the accompaniment track(s) as `accompaniment`. The script treats melody tracks as excluded from accompaniment analysis unless you pass `--keep-melody`.
-
----
-
-## Usage Examples
-
-### Basic comparison
+## Quick PolyDis Evaluation for a Single Prompt Folder
+`run_prompt_polydis_eval.sh` wraps the evaluator for one prompt directory:
 
 ```bash
-python scripts/evaluate_accompaniment_metrics.py \
-  --generated-dir path/to/generated_midis \
-  --groundtruth-dir path/to/groundtruth_midis
+bash eval/run_prompt_polydis_eval.sh /exp/aria_eval/prompt75
 ```
 
-### With PolyDis and automatic phrase analysis
+The script expands to:
+- `--generated-dir <prompt>/generated`
+- `--groundtruth-dir <prompt>/gt`
+- `--polydis-root icm-deep-music-generation` (override with your checkout)
+- `--melody-track-names Guitar`
+- `--frechet-music-distance`
+- `--auto-phrase-analysis`
 
+Any extra arguments (e.g. different cache paths, instrument filters) are passed
+through to `evaluate_accompaniment_metrics.py`.
+
+## Evaluating Many Prompt Folders
+Use `batch_evaluate_accompaniment_metrics.sh` to iterate across prompt
+directories (e.g. `prompt75`, `prompt150`, ...). The script expects each run to
+contain `promptXX/<generated-subdir>` and `promptXX/<groundtruth-subdir>`.
+
+### Using a Config File
+Add lines of the form `label:/abs/path/to/run` to a text file (see
+`batch_runs.conf`). Then run:
 ```bash
-python scripts/evaluate_accompaniment_metrics.py \
-  --generated-dir tmp_eval/generated \
-  --groundtruth-dir tmp_eval/groundtruth \
-  --auto-phrase-analysis --phrase-bars 4 \
-  --phrase-rhythm-resolution 0.01 \
-  --polydis-root /path/to/icm-deep-music-generation \
-  --output-json tmp_eval/results.json
+bash eval/batch_evaluate_accompaniment_metrics.sh eval/batch_runs.conf \
+    --output results/music_quality_results_batch.csv \
+    --generated-subdir generated \
+    --groundtruth-subdir gt \
+    -- --frechet-music-distance \
+       --polydis-root /path/to/icm-deep-music-generation
 ```
+Arguments after `--` are forwarded to `evaluate_accompaniment_metrics.py` for
+every prompt. The script writes a CSV with one row per model/prompt pair and
+stores the raw textual summaries alongside it.
 
-### Using hand-crafted phrase windows
+**Defaults the batch script adds automatically (unless you pass your own):**
+- `--polydis-root` pointing to `/mnt/weka/home/jianshu.she/xy/eval_/icm-deep-music-generation`.
+- `--frechet-music-distance`.
+- `--auto-phrase-analysis`.
+- `--melody-track-names Guitar` (treat guitar-labeled tracks as melody and drop them).
+Use the arguments after `--` to override any of these behaviours (e.g. specify a
+different PolyDis checkout or disable FMD).
 
+### Supplying Runs Inline
+Alternatively, pass `label:/path` pairs on the command line:
 ```bash
-python scripts/evaluate_accompaniment_metrics.py \
-  --generated-dir ... \
-  --groundtruth-dir ... \
-  --validation-phrases path/to/phrases.jsonl \
-  --phrase-window-seconds 2.0 \
-  --phrase-rhythm-resolution 0.01
+bash eval/batch_evaluate_accompaniment_metrics.sh \
+    aria:/exp/aria_eval dropout:/exp/dropout_eval \
+    --output results/music_quality_results_batch.csv
 ```
 
-Common melody filters:
-
-- `--melody-track-names flute vocal`
-- `--melody-programs 0 4`
-- `--melody-track-indices 0`
-- Add `--keep-melody` to retain melody tracks during analysis.
-
----
-
-## Outputs
-
-### Console Summary (Grouped)
-
-```
-Pairs evaluated: 12
-Accompaniment vs Ground Truth:
-  Pitch JSD: 0.0203
-  Onset JSD: 0.0028
-  Duration JSD: 0.0145
-  PolyDis txt_mean: 6.6490
-  PolyDis chd_mean: 4.7192
-  PolyDis segments: 431
-
-Accompaniment Inter-Track Continuity:
-  Random: RD diff=1.2145 (±0.9542), VN diff=0.6921 (±0.5710), n=1000
-  Same Song: RD diff=0.8473 (±0.8025), VN diff=0.5419 (±0.4882), n=8724
-  Adjacent: RD diff=0.4620 (±0.5087), VN diff=0.3984 (±0.4026), n=398
-  Auto phrase (gen vs gt): RD diff=0.3117 (±0.3528), VN diff=0.5289 (±0.2941), n=512
-
-Accompaniment <-> Melody:
-  Harmonic consonant ratio: 0.9185
-  Harmonic dissonant ratio: 0.0584
-  Harmonic unsupported ratio: 0.0231
-  Chord accuracy: 0.7429
+## Plotting Music Quality Charts
+Feed the aggregated CSV into `plot_music_quality.py` to recreate the JSD/FMD
+dashboard:
+```bash
+python eval/plot_music_quality.py results/music_quality_results_batch.csv \
+    --jsd-output images/music_quality_jsd_boxplots.png \
+    --fmd-output images/music_quality_fmd.png \
+    --polydis-output images/music_quality_polydis_texture.png \
+    --harmonicity-output images/music_quality_harmonicity.png
 ```
 
-### JSON (`--output-json`)
+The plotting script expects the CSV structure produced by the batch evaluator
+(columns named by model labels and prompt lengths). Adjust the output paths as
+needed; they will be created if absent.
 
-Structured for downstream analysis:
 
-```json
-{
-  "meta": {"pairs": 12},
-  "summary": {
-    "accompaniment_vs_groundtruth": { ... },
-    "inter_track_continuity": { ... },
-    "melody_relationship": { ... }
-  },
-  "details": [
-    {
-      "piece": "001",
-      "pitch_jsd": 0.0187,
-      "polydis": {"segments": 42, "txt_mean_distance": 5.21, ...},
-      "auto_phrase_metrics": { ... },
-      "harmonicity": { ... }
-    },
-    "..."
-  ]
-}
-```
-
----
-
-## Metrics at a Glance
-
-| Group                       | Metrics                                                                         |
-|-----------------------------|----------------------------------------------------------------------------------|
-| Accompaniment vs Ground Truth | Pitch/Onset/Duration JS divergence; PolyDis latent distance (txt/chord).        |
-| Inter-Track Continuity      | RD/VN differences for Random, Same Song, Adjacent phrase pairs + auto vs GT.    |
-| Accompaniment ↔ Melody      | Harmonic consonant/dissonant/unsupported ratios; chord accuracy (if available). |
-
-Lower JS divergence and PolyDis scores indicate closer matches. For RD/VN, expect Adjacent < Same Song < Random; large jumps flag discontinuities.
-
----
-
-## Comparing Model Variants
-
-1. Run the script for each configuration (e.g., dropout/no-dropout, prompt lengths, alternate melodies).
-2. Collect the JSON summaries (`summary.accompaniment_vs_groundtruth`, etc.).
-3. Load them into a notebook or DataFrame to build side-by-side tables or visualizations.
-
----
-
-## Troubleshooting
-
-- *PolyDis warning*: ensure `polydis-v1.pt` exists and `--polydis-root` points at the codebase.
-- *Missing chords/harmonicity*: if either melody or accompaniment notes are absent, the harmonic metrics fall back to `n/a`.
-- *pretty_midi errors*: some Linux distros need `libasound2-dev` or similar system libraries.
-- *CUDA messages*: harmless on CPU-only machines; PyTorch falls back automatically.
-
----
-
-## Repository Layout (Suggested)
-
-```
-scripts/
-  evaluate_accompaniment_metrics.py
-  README.md
-requirements.txt
-poly_dis/            # optional vendored dependency
-tmp_eval/            # optional example data
-```
-
-Share this script alongside dependencies, PolyDis assets, and example data so teammates can reproduce the evaluation quickly.
+## Tips
+- Heavy metrics (PolyDis, FMD) are optional—skip them when iterating quickly,
+  then rerun with caching enabled for final reports.
+- Clone the PolyDis repository once:
+  ```bash
+  git clone https://github.com/ZZWaang/icm-deep-music-generation.git ~/poly_dis
+  ```
+  Then pass `--polydis-root ~/poly_dis` (or set that path in the batch script) whenever
+  you require texture metrics.
+- Keep `results/` and `images/` directories tidy by pointing `--output` and the
+  plotting destinations to unique filenames per experiment.
+- For ad-hoc experiments, run the single evaluator first, then manually append
+  rows to a CSV before plotting.
