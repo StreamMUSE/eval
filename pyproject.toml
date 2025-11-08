@@ -1,0 +1,13 @@
+[project]
+name = "eval"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "frechet-music-distance>=1.0.0",
+    "matplotlib>=3.10.7",
+    "mir-eval>=0.8.2",
+    "pandas>=2.3.3",
+    "pretty-midi>=0.2.11",
+]

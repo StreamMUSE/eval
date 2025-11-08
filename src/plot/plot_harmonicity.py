@@ -4,8 +4,9 @@
 从你提供的 JSON（像 attentiondropout_128_wo_prompt.json）读取 per-piece JSD 值并绘制按 model 分组的 boxplot。
 用法示例：
   python plot_jsd.py results/attentiondropout_128_wo_prompt.json -o jsd.png
-  python plot_jsd.py results/*.json -o jsd_all_models.png
+  uv run src/plot/plot_jsd.py results/*.json -o jsd_all_models.png
 """
+
 from __future__ import annotations
 
 import argparse
@@ -18,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 METRIC_KEYS = {
-    "consonant_ratio": "CR",           # 如果你修改了 load_jsd_from_json 去读取这个嵌套路径
+    "consonant_ratio": "CR",  # 如果你修改了 load_jsd_from_json 去读取这个嵌套路径
     "dissonant_ratio": "DR",
     "unsupported_ratio": "UR",
 }
@@ -28,11 +29,14 @@ BOX_ALPHA = 0.75
 
 
 # ...existing code...
-def load_jsd_from_json(path: Path, model_name: str | None = None) -> tuple[pd.DataFrame, Dict[str, dict]]:
+def load_jsd_from_json(
+    path: Path, model_name: str | None = None
+) -> tuple[pd.DataFrame, Dict[str, dict]]:
     """从 file 读取 samples 与 summary。
     - 优先尝试按 METRIC_KEYS 的点路径直接从 details 读取数值；
     - 如果未命中，则从 details[].auto_phrase_metrics 里的 generated / ground_truth 计算 RD/VN 差异（每个 piece 产一个样本）；
     - 同时提取 summary.inter_track_continuity 的五数（若存在）。"""
+
     def get_by_path(obj, path: str):
         cur = obj
         for part in path.split("."):
@@ -53,7 +57,9 @@ def load_jsd_from_json(path: Path, model_name: str | None = None) -> tuple[pd.Da
     # 1) summary.inter_track_continuity -> summaries（如果存在）
     if isinstance(obj, dict):
         summary = obj.get("summary") or {}
-        inter = summary.get("inter_track_continuity") if isinstance(summary, dict) else None
+        inter = (
+            summary.get("inter_track_continuity") if isinstance(summary, dict) else None
+        )
         if isinstance(inter, dict):
             for key, label in METRIC_KEYS.items():
                 stat = get_by_path(inter, key)
@@ -66,8 +72,14 @@ def load_jsd_from_json(path: Path, model_name: str | None = None) -> tuple[pd.Da
                         mx = stat.get("max")
                         cnt = int(stat.get("count", stat.get("n", 0)) or 0)
                         if None not in (q1, med, q3, mn, mx):
-                            summaries[label] = {"q1": float(q1), "med": float(med), "q3": float(q3),
-                                                "min": float(mn), "max": float(mx), "count": cnt}
+                            summaries[label] = {
+                                "q1": float(q1),
+                                "med": float(med),
+                                "q3": float(q3),
+                                "min": float(mn),
+                                "max": float(mx),
+                                "count": cnt,
+                            }
                     except Exception:
                         continue
 
@@ -82,16 +94,25 @@ def load_jsd_from_json(path: Path, model_name: str | None = None) -> tuple[pd.Da
                 continue
 
             # fallback: 从 auto_phrase_metrics 的 generated / ground_truth 计算 per-piece 差异样本
-            h = entry.get("harmonicity") if isinstance(entry.get("harmonicity"), dict) else {}
+            h = (
+                entry.get("harmonicity")
+                if isinstance(entry.get("harmonicity"), dict)
+                else {}
+            )
             for key, label in METRIC_KEYS.items():
                 if key in h and h[key] is not None:
                     try:
-                        rows.append({"model": model, "metric": label, "value": float(h[key])})
+                        rows.append(
+                            {"model": model, "metric": label, "value": float(h[key])}
+                        )
                     except Exception:
                         continue
 
     return pd.DataFrame(rows), summaries
+
+
 # ...existing code...
+
 
 def collect_many(paths: List[Path]) -> tuple[pd.DataFrame, Dict[str, Dict[str, dict]]]:
     """收集多个文件，返回 (all_samples_df, summaries_by_model)
@@ -105,11 +126,17 @@ def collect_many(paths: List[Path]) -> tuple[pd.DataFrame, Dict[str, Dict[str, d
             dfs.append(df)
         if stats:
             summaries_all[p.stem] = stats
-    all_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=["model", "metric", "value"])
+    all_df = (
+        pd.concat(dfs, ignore_index=True)
+        if dfs
+        else pd.DataFrame(columns=["model", "metric", "value"])
+    )
     return all_df, summaries_all
 
 
-def plot_grouped_jsd(df: pd.DataFrame, summaries: Dict[str, Dict[str, dict]], out: Path) -> None:
+def plot_grouped_jsd(
+    df: pd.DataFrame, summaries: Dict[str, Dict[str, dict]], out: Path
+) -> None:
     """优先用 df 的原始样本绘制 boxplot；若 df 为空则用 summaries 绘 bxp（五数）。"""
     if (df.empty) and (not summaries):
         raise RuntimeError("既没有原始 samples，也没有 summary 可用来绘图。")
@@ -150,20 +177,44 @@ def plot_grouped_jsd(df: pd.DataFrame, summaries: Dict[str, Dict[str, dict]], ou
         fig_width = max(6, n_models * (n_metrics * box_width * inner_factor + 0.2))
         fig, ax = plt.subplots(figsize=(fig_width, 5))
 
-        bp = ax.boxplot(data_lists, positions=positions, widths=box_width, patch_artist=True, showmeans=True)
+        bp = ax.boxplot(
+            data_lists,
+            positions=positions,
+            widths=box_width,
+            patch_artist=True,
+            showmeans=True,
+        )
         for patch, col in zip(bp["boxes"], colors):
-            patch.set_facecolor(col); patch.set_edgecolor(col); patch.set_alpha(BOX_ALPHA)
+            patch.set_facecolor(col)
+            patch.set_edgecolor(col)
+            patch.set_alpha(BOX_ALPHA)
         for median in bp.get("medians", []):
             median.set_color("black")
         for mean in bp.get("means", []):
-            mean.set_markerfacecolor("white"); mean.set_markeredgecolor("black")
+            mean.set_markerfacecolor("white")
+            mean.set_markeredgecolor("black")
 
-        ax.set_xticks(centers); ax.set_xticklabels(models, rotation=30, ha="right")
-        ax.set_ylabel("inter_track_continuity"); ax.set_title("inter_track_continuity by model — " + " / ".join(METRIC_ORDER))
-        handles = [plt.Line2D([0], [0], marker="s", color="none", markerfacecolor=METRIC_COLORS[m], markersize=8, alpha=BOX_ALPHA) for m in METRIC_ORDER]
+        ax.set_xticks(centers)
+        ax.set_xticklabels(models, rotation=30, ha="right")
+        ax.set_ylabel("inter_track_continuity")
+        ax.set_title("inter_track_continuity by model — " + " / ".join(METRIC_ORDER))
+        handles = [
+            plt.Line2D(
+                [0],
+                [0],
+                marker="s",
+                color="none",
+                markerfacecolor=METRIC_COLORS[m],
+                markersize=8,
+                alpha=BOX_ALPHA,
+            )
+            for m in METRIC_ORDER
+        ]
         ax.legend(handles, METRIC_ORDER, title="Metric", loc="upper right")
         ax.grid(axis="y", linestyle="--", alpha=0.3)
-        fig.tight_layout(); fig.savefig(out, dpi=300, bbox_inches="tight"); plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(out, dpi=300, bbox_inches="tight")
+        plt.close(fig)
         return
 
     # 如果没有原始样本，使用 summaries 绘制基于统计量的箱线（ax.bxp）
@@ -189,35 +240,73 @@ def plot_grouped_jsd(df: pd.DataFrame, summaries: Dict[str, Dict[str, dict]], ou
             if not s:
                 continue
             stat = {
-                "med": float(s["med"] if "med" in s else s["med"] if "med" in s else s["med"]) if "med" in s else float(s["median"]),
-                "q1": float(s["q1"]), "q3": float(s["q3"]),
-                "whislo": float(s["min"]), "whishi": float(s["max"]),
-                "fliers": []
+                "med": float(
+                    s["med"] if "med" in s else s["med"] if "med" in s else s["med"]
+                )
+                if "med" in s
+                else float(s["median"]),
+                "q1": float(s["q1"]),
+                "q3": float(s["q3"]),
+                "whislo": float(s["min"]),
+                "whishi": float(s["max"]),
+                "fliers": [],
             }
             offset = (j - (n_metrics - 1) / 2) * inner_spacing
             pos = center + offset
-            stats_list.append(stat); positions.append(pos); colors.append(METRIC_COLORS.get(metric, "#777777"))
+            stats_list.append(stat)
+            positions.append(pos)
+            colors.append(METRIC_COLORS.get(metric, "#777777"))
 
     plt.style.use("seaborn-v0_8-whitegrid")
     fig_width = max(6, n_models * (n_metrics * box_width * inner_factor + 0.2))
     fig, ax = plt.subplots(figsize=(fig_width, 5))
-    bxp = ax.bxp(stats_list, positions=positions, widths=box_width, showmeans=False, patch_artist=True)
+    bxp = ax.bxp(
+        stats_list,
+        positions=positions,
+        widths=box_width,
+        showmeans=False,
+        patch_artist=True,
+    )
     for patch, col in zip(bxp["boxes"], colors):
-        patch.set_facecolor(col); patch.set_edgecolor(col); patch.set_alpha(BOX_ALPHA)
+        patch.set_facecolor(col)
+        patch.set_edgecolor(col)
+        patch.set_alpha(BOX_ALPHA)
     for median in bxp.get("medians", []):
         median.set_color("black")
 
-    ax.set_xticks(centers); ax.set_xticklabels(models, rotation=30, ha="right")
-    ax.set_ylabel("inter_track_continuity"); ax.set_title("inter_track_continuity by model — " + " / ".join(METRIC_ORDER))
-    handles = [plt.Line2D([0], [0], marker="s", color="none", markerfacecolor=METRIC_COLORS[m], markersize=8, alpha=BOX_ALPHA) for m in METRIC_ORDER]
+    ax.set_xticks(centers)
+    ax.set_xticklabels(models, rotation=30, ha="right")
+    ax.set_ylabel("inter_track_continuity")
+    ax.set_title("inter_track_continuity by model — " + " / ".join(METRIC_ORDER))
+    handles = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker="s",
+            color="none",
+            markerfacecolor=METRIC_COLORS[m],
+            markersize=8,
+            alpha=BOX_ALPHA,
+        )
+        for m in METRIC_ORDER
+    ]
     ax.legend(handles, METRIC_ORDER, title="Metric", loc="upper right")
     ax.grid(axis="y", linestyle="--", alpha=0.3)
-    fig.tight_layout(); fig.savefig(out, dpi=300, bbox_inches="tight"); plt.close(fig)
+    fig.tight_layout()
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
 
 def main():
-    parser = argparse.ArgumentParser(description="从 JSON(s) 绘制分模型 inter_track_continuity boxplot。")
-    parser.add_argument("jsons", nargs="+", help="一个或多个 JSON 文件路径（可用通配符）。")
-    parser.add_argument("-o", "--out", type=Path, default=Path("itc_grouped_boxplot.png"))
+    parser = argparse.ArgumentParser(
+        description="从 JSON(s) 绘制分模型 inter_track_continuity boxplot。"
+    )
+    parser.add_argument(
+        "jsons", nargs="+", help="一个或多个 JSON 文件路径（可用通配符）。"
+    )
+    parser.add_argument(
+        "-o", "--out", type=Path, default=Path("itc_grouped_boxplot.png")
+    )
     args = parser.parse_args()
 
     paths = [Path(p) for p in args.jsons]
@@ -231,6 +320,7 @@ def main():
 
     plot_grouped_jsd(df, summaries, args.out)
     print(f"Saved inter-track continuity plot to {args.out.resolve()}")
+
 
 if __name__ == "__main__":
     main()
