@@ -28,6 +28,10 @@ METRIC_ORDER = ["Pitch", "Onset", "Duration"]
 METRIC_COLORS = {"Pitch": "#4C72B0", "Onset": "#55A868", "Duration": "#DD8452"}
 BOX_ALPHA = 0.75
 
+# Natural sort key: splits on runs of digits and converts digit runs to int
+def _natural_key(s: str):
+    parts = re.split(r'(\d+)', str(s))
+    return tuple(int(p) if p.isdigit() else p.lower() for p in parts)
 
 def load_jsd_from_json(path: Path, model_name: str | None = None) -> pd.DataFrame:
     """从单个 JSON 文件提取每-piece 的 pitch/onset/duration JSD，返回 DataFrame rows: model, metric, value."""
@@ -95,7 +99,7 @@ def plot_grouped_jsd(df: pd.DataFrame, out: Path, plot_type: str = "box") -> Non
             "没有可绘制的数据（请检查 JSON 是否包含 details 数组或 summary 聚合）。"
         )
 
-    models = sorted(df["model"].unique())
+    models = sorted(df["model"].unique(), key=_natural_key)
     n_models = len(models)
     n_metrics = len(METRIC_ORDER)
 
