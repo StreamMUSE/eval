@@ -222,6 +222,75 @@ def plot_batch_run(entries: List[Dict[str, Any]], out_dir: Path) -> Path | None:
     out_path = out_dir / f"{fname_base}_performance.png"
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+    # 保存图片中使用的数据（CSV + JSON）
+    try:
+        df = pd.DataFrame(
+            {
+                "tick": x.tolist(),
+                "hit_rate": [float(v) if not np.isnan(v) else None for v in y_hit.tolist()],
+                "avg_backup": [float(v) if not np.isnan(v) else None for v in y_backup.tolist()],
+            }
+        )
+
+        # 计算全局指标（遍历原始 histories，total_samples 包括所有记录，total_hits 只计 is_hit==True）
+        total_samples = 0
+        total_hits = 0
+        backup_vals: List[float] = []
+        for h in histories:
+            if not isinstance(h, list):
+                continue
+            for rec in h:
+                if not isinstance(rec, dict):
+                    continue
+                total_samples += 1
+                if bool(rec.get("is_hit", False)):
+                    total_hits += 1
+                    b = rec.get("backup_level")
+                    try:
+                        if b is not None:
+                            backup_vals.append(float(b))
+                    except Exception:
+                        continue
+
+        global_hit_rate = float(total_hits) / float(total_samples) if total_samples > 0 else float("nan")
+        global_avg_backup = float(np.mean(backup_vals)) if backup_vals else float("nan")
+
+        # 为 CSV：在 per-tick 表末尾追加一行 summary （tick 字段用字符串 "GLOBAL"）
+        summary_row = {
+            "tick": "GLOBAL",
+            "hit_rate": (float(global_hit_rate) if not np.isnan(global_hit_rate) else None),
+            "avg_backup": (float(global_avg_backup) if not np.isnan(global_avg_backup) else None),
+            "total_samples": int(total_samples),
+            "total_hits": int(total_hits),
+        }
+        # 将 df 转为 object 类型以容纳混合类型列，然后追加 summary
+        df_csv = df.copy().astype(object)
+        # 添加 cols total_samples/total_hits 到 df_csv（行为空）
+        df_csv["total_samples"] = None
+        df_csv["total_hits"] = None
+        df_csv = pd.concat([df_csv, pd.DataFrame([summary_row])], ignore_index=True)
+
+        csv_path = out_dir / f"{fname_base}_performance.csv"
+        df_csv.to_csv(csv_path, index=False)
+
+        # 为 JSON：保存 records + global summary 字段
+        json_path = out_dir / f"{fname_base}_performance.json"
+        out_obj = {
+            "records": df.to_dict(orient="records"),
+            "global": {
+                "global_hit_rate": None if np.isnan(global_hit_rate) else float(global_hit_rate),
+                "global_avg_backup": None if np.isnan(global_avg_backup) else float(global_avg_backup),
+                "total_samples": int(total_samples),
+                "total_hits": int(total_hits),
+            },
+        }
+        with json_path.open("w", encoding="utf-8") as jf:
+            json.dump(out_obj, jf, ensure_ascii=False, indent=2)
+            
+    except Exception as e:
+        logging.warning("Failed to save data file for %s: %s", out_path, e)
+
     return out_path
 
 

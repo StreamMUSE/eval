@@ -1159,23 +1159,32 @@ def _collect_ground_truth_accompaniment_notes(
     return notes
 
 
-_PROMPT_DIR_PATTERN = re.compile(r"^prompt(\d+)$", re.IGNORECASE)
-
+# _PROMPT_DIR_PATTERN = re.compile(r"^prompt(\d+)$", re.IGNORECASE)
+_PROMPT_DIR_PATTERN = re.compile(r"prompt[_-]?(\d+)", re.IGNORECASE)
 
 def _infer_prompt_accompaniment_path(
     generated_path: Path,
     groundtruth_path: Path,
 ) -> Optional[Path]:
     """Return the prompt accompaniment path inferred from directory naming conventions."""
-    for parent in generated_path.parents:
+    for parent in groundtruth_path.parents:
         match = _PROMPT_DIR_PATTERN.match(parent.name)
         if not match:
+            # print("no match for", parent.name)
             continue
         prompt_len = match.group(1)
         name_variants: set[str] = {groundtruth_path.name}
         stem = groundtruth_path.stem
         if stem:
             name_variants.add(stem)
+
+        # 使用 _normalized_stem，去掉首个 ".mid" 及之后的附加后缀
+        norm = _normalized_stem(groundtruth_path)
+        if norm:
+            name_variants.add(norm)
+            # 也加入带 ".mid" 的变体，以匹配像 "Beaux of Oakhill_1.mid_promptlen128.mid"
+            name_variants.add(f"{norm}.mid")
+
         trimmed = stem
         while trimmed and trimmed.endswith(".mid"):
             trimmed = trimmed[:-4]
