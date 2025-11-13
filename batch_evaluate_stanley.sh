@@ -16,12 +16,11 @@ PROMPT_DIR_NAME="prompt_128_gen_576"      # 用于 generated 路径
 GT_PROMPT_DIR_NAME="prompt128_gen576"     # 用于 groundtruth 路径
 
 # 根目录（按你的示例调整）
-REALTIME_ROOT="/home/ubuntu/ugrip/stanleyz/StreamMUSE/experiments2-local_server/realtime/baseline"
+REALTIME_ROOT="/home/ubuntu/ugrip/stanleyz/StreamMUSE/experiments2-remote/realtime/baseline"
 GT_ROOT="/home/ubuntu/ugrip/stanleyz/StreamMUSE/experiments2-local/baseline/Baseline0.12B"
 
 # 输出结果目录前缀
-OUT_ROOT="results-experiment2-local_server"
-
+OUT_ROOT="results-experiments2-remote"
 # 其它固定参数
 MELODY="Guitar"
 POLYDIS_ROOT="./icm-deep-music-generation"

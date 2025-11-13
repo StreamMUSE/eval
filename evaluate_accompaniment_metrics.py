@@ -708,7 +708,7 @@ def _compute_polydis_latent_similarity(
 ) -> Optional[dict]:
     if polydis_root is None:
         return None
-    if not generated_notes or not ground_truth_notes:
+    if not ground_truth_notes:
         return None
 
     try:
@@ -727,15 +727,19 @@ def _compute_polydis_latent_similarity(
     alpha = 0.25 * 60.0 / tempo
     segment_duration = num_steps * alpha
 
-    gen_end = max((note.end for note in generated_notes), default=0.0)
-    gt_end = max((note.end for note in ground_truth_notes), default=0.0)
-    common_end = min(gen_end, gt_end)
-    if common_end <= 1e-6:
-        common_end = max(gen_end, gt_end)
-    if common_end <= 1e-6:
-        return None
+    gen_end = max(
+        generated_midi.get_end_time(),
+        max((note.end for note in generated_notes), default=0.0),
+    )
+    gt_end = max(
+        ground_truth_midi.get_end_time(),
+        max((note.end for note in ground_truth_notes), default=0.0),
+    )
+    analysis_end = max(gen_end, gt_end)
+    if analysis_end <= 1e-6:
+        analysis_end = segment_duration
 
-    segments = max(1, int(math.ceil(common_end / segment_duration)))
+    segments = max(1, int(math.ceil(analysis_end / segment_duration)))
 
     gen_pr_list: List[np.ndarray] = []
     gen_chords: List[np.ndarray] = []
@@ -1159,8 +1163,8 @@ def _collect_ground_truth_accompaniment_notes(
     return notes
 
 
-# _PROMPT_DIR_PATTERN = re.compile(r"^prompt(\d+)$", re.IGNORECASE)
-_PROMPT_DIR_PATTERN = re.compile(r"prompt[_-]?(\d+)", re.IGNORECASE)
+_PROMPT_DIR_PATTERN = re.compile(r"prompt(?:len)?[_\-]?(\d+)", re.IGNORECASE)
+
 
 def _infer_prompt_accompaniment_path(
     generated_path: Path,
@@ -1170,21 +1174,13 @@ def _infer_prompt_accompaniment_path(
     for parent in groundtruth_path.parents:
         match = _PROMPT_DIR_PATTERN.match(parent.name)
         if not match:
-            # print("no match for", parent.name)
+            # print(f"Debug: Directory name {parent.name} does not match prompt pattern.")
             continue
         prompt_len = match.group(1)
         name_variants: set[str] = {groundtruth_path.name}
         stem = groundtruth_path.stem
         if stem:
             name_variants.add(stem)
-
-        # 使用 _normalized_stem，去掉首个 ".mid" 及之后的附加后缀
-        norm = _normalized_stem(groundtruth_path)
-        if norm:
-            name_variants.add(norm)
-            # 也加入带 ".mid" 的变体，以匹配像 "Beaux of Oakhill_1.mid_promptlen128.mid"
-            name_variants.add(f"{norm}.mid")
-
         trimmed = stem
         while trimmed and trimmed.endswith(".mid"):
             trimmed = trimmed[:-4]
@@ -1520,8 +1516,8 @@ def evaluate_pair(
                 LOGGER.warning("Skipping PolyDis metric for %s due to prompt load failure.", generated_path.name)
             else:
                 LOGGER.warning("Prompt accompaniment missing for %s; skipping PolyDis metric.", generated_path.name)
-        elif not generated_notes or not prompt_notes:
-            LOGGER.warning("Insufficient notes for PolyDis metric in %s", generated_path.name)
+        elif not prompt_notes:
+            LOGGER.warning("Insufficient prompt notes for PolyDis metric in %s", generated_path.name)
         else:
             prompt_polydis = _compute_polydis_latent_similarity(
                 generated_midi,
@@ -1530,7 +1526,7 @@ def evaluate_pair(
                 prompt_notes,
                 args.polydis_root,
             )
-            if generated_continuation_notes:
+            if prompt_end_time is not None:
                 prompt_generated_continuation_polydis = _compute_polydis_latent_similarity(
                     generated_midi,
                     generated_continuation_notes,
@@ -1538,13 +1534,13 @@ def evaluate_pair(
                     prompt_notes,
                     args.polydis_root,
                 )
-            elif prompt_end_time is not None:
-                LOGGER.warning(
-                    "No generated continuation notes available past prompt for %s; skipping prompt-generated PolyDis.",
-                    generated_path.name,
-                )
+                if not generated_continuation_notes:
+                    LOGGER.warning(
+                        "Generated continuation is empty past prompt for %s; treating as silence in PolyDis.",
+                        generated_path.name,
+                    )
 
-            if prompt_continuation_notes:
+            if prompt_end_time is not None:
                 prompt_groundtruth_continuation_polydis = _compute_polydis_latent_similarity(
                     prompt_midi,
                     prompt_notes,
@@ -1552,11 +1548,11 @@ def evaluate_pair(
                     prompt_continuation_notes,
                     args.polydis_root,
                 )
-            elif prompt_end_time is not None:
-                LOGGER.warning(
-                    "No ground-truth continuation notes available past prompt for %s; skipping prompt-ground-truth PolyDis.",
-                    generated_path.name,
-                )
+                if not prompt_continuation_notes:
+                    LOGGER.warning(
+                        "Ground-truth continuation is empty past prompt for %s; treating as silence in PolyDis.",
+                        generated_path.name,
+                    )
 
     auto_phrase_metrics = None
     if args.auto_phrase_analysis:
