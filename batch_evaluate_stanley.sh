@@ -12,15 +12,13 @@ INTERVALS=(1 2 4 7)
 GEN_FRAMES=(3 5 9 15)
 
 # 样例命令中固定的 prompt / gen 标记
-PROMPT_DIR_NAME="prompt_128_gen_576"      # 用于 generated 路径
-GT_PROMPT_DIR_NAME="prompt128_gen576"     # 用于 groundtruth 路径
+PROMPT_DIR_NAME="prompt_128_gen_576"      # 用于 generated 和 groundtruth 路径的父目录名
 
 # 根目录（按你的示例调整）
-REALTIME_ROOT="/home/ubuntu/ugrip/stanleyz/StreamMUSE/experiments2-remote/realtime/baseline"
-GT_ROOT="/home/ubuntu/ugrip/stanleyz/StreamMUSE/experiments2-local/baseline/Baseline0.12B"
+REALTIME_ROOT="/home/ubuntu/ugrip/stanleyz/AE/experiments-AE4/realtime/baseline"
 
 # 输出结果目录前缀
-OUT_ROOT="results-experiments2-remote"
+OUT_ROOT="results-experiments-AE4"
 # 其它固定参数
 MELODY="Guitar"
 POLYDIS_ROOT="./icm-deep-music-generation"
@@ -38,7 +36,7 @@ mkdir -p "${OUT_ROOT}"
 for I in "${INTERVALS[@]}"; do
   for G in "${GEN_FRAMES[@]}"; do
     GENERATED_DIR="${REALTIME_ROOT}/interval_${I}_gen_frame_${G}/${PROMPT_DIR_NAME}/generated"
-    GT_DIR="${GT_ROOT}/${GT_PROMPT_DIR_NAME}/gt_without_prompt"
+    GT_DIR="${REALTIME_ROOT}/interval_${I}_gen_frame_${G}/${PROMPT_DIR_NAME}/gt_generation"
     OUT_FILE="${OUT_ROOT}/interval${I}_gen${G}_prompt_128_gen_576.json"
 
     # 打印并检查路径存在性（仅警告，不终止）
