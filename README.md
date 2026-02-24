@@ -128,3 +128,52 @@ needed; they will be created if absent.
   plotting destinations to unique filenames per experiment.
 - For ad-hoc experiments, run the single evaluator first, then manually append
   rows to a CSV before plotting.
+
+---
+
+## NLL Evaluation (NLL 负对数似然评测)
+
+NLL (Negative Log-Likelihood) measures how well the model predicts the accompaniment given a melody. A **lower NLL is better**.
+
+### Step 1 — Compute raw NLL (in StreamMUSE repo)
+
+Run on the machine with the GPU and the trained model checkpoint. See [`src/nll_compute/README.md`](src/nll_compute/README.md) for the full workflow, but the quick-start command is:
+
+```bash
+# Run from f:\repos\StreamMUSE-1
+uv run python -m nll_compute.runners.run_cal_nll \
+  --midi_dir /path/to/generated/midi \
+  --ckpt_path /path/to/model.ckpt \
+  --save_json_path records/nll_runs/exp1.json \
+  --window 384 --offset 128
+```
+
+*(Note: `nll_compute` is a top-level package in `StreamMUSE-1`, so no prefix needed there.)*
+
+This writes a raw JSON like `{ "001.mid": { "avg_nll": 2.31, "total_nll": ..., "total_tokens": ... }, ... }`.
+
+### Step 2 — Aggregate statistics (in this repo)
+
+```bash
+# Run from f:\repos\eval
+uv run python -m src.nll_compute.runners.run_aggregate \
+  --input records/nll_runs/exp1.json \
+  --output reports/exp1_summary.json \
+  --pretty
+```
+
+### Step 3 — Plot heatmap across grid experiments (optional)
+
+If you swept across parameters (e.g. `interval` × `gen_frame`), plot a 2D heatmap:
+
+```bash
+uv run python -m src.nll_compute.runners.run_heatmap \
+  --input-dir records/nll_runs/experiments1 \
+  --out reports/heatmap_exp1.png \
+  --csv-out reports/heatmap_exp1.csv \
+  --value-mode weighted_avg --annotate
+```
+
+> **Where to look:** Aggregation logic → [`src/nll_compute/aggregate.py`](src/nll_compute/aggregate.py)  
+> Heatmap logic → [`src/nll_compute/plot_nll_heatmap.py`](src/nll_compute/plot_nll_heatmap.py)  
+> Shared stats/parsing tools → [`src/eval_toolkit/`](src/eval_toolkit/README.md)

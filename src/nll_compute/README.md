@@ -21,21 +21,19 @@ and provides aggregation statistics and heatmap visualization tools.
 ## Workflow (工作流)
 
 ```
-StreamMUSE nll_compute          →   eval/src/nll_compute
-────────────────────────────────────────────────────────
-1. uv run python -m                 2. uv run python -m
-   nll_compute.runners.                nll_compute.runners.
-   run_cal_nll                         run_aggregate
-   --midi_dir /path/to/midi            --input records/nll_runs/exp1.json
-   --ckpt_path /path/model.ckpt        --output reports/summary.json
-   --save_json output/exp1.json        --pretty
+StreamMUSE nll_compute (no src. prefix)   →   eval/src/nll_compute (needs src. prefix)
+────────────────────────────────────────────────────────────────────────────────────────
+1. uv run python -m                            2. uv run python -m
+   nll_compute.runners.run_cal_nll                src.nll_compute.runners.run_aggregate
+   --midi_dir /path/to/midi                       --input records/nll_runs/exp1.json
+   --ckpt_path /path/model.ckpt                   --output reports/summary.json
+   --save_json output/exp1.json                   --pretty
 
-                                    3. uv run python -m
-                                       nll_compute.runners.
-                                       run_heatmap
-                                       --input-dir records/nll_runs/experiments1
-                                       --out reports/heatmap.png
-                                       --value-mode weighted_avg --annotate
+                                               3. uv run python -m
+                                                  src.nll_compute.runners.run_heatmap
+                                                  --input-dir records/nll_runs/experiments1
+                                                  --out reports/heatmap.png
+                                                  --value-mode weighted_avg --annotate
 ```
 
 ## Aggregation Output Format (聚合输出格式)
