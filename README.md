@@ -135,45 +135,76 @@ needed; they will be created if absent.
 
 NLL (Negative Log-Likelihood) measures how well the model predicts the accompaniment given a melody. A **lower NLL is better**.
 
+### ⚠️ Path Convention (路径约定) — IMPORTANT
+
+`add_nll_to_summary.py` automatically discovers NLL results by looking for files named `experiments*.json` inside a `nll_runs/` subdirectory of your results folder. You **must** follow this naming convention when saving NLL output from StreamMUSE-1:
+
+```
+results-<experiment-name>/          ← your experiment results folder
+├── <music quality JSON files>      ← produced by evaluate_accompaniment_metrics.py
+├── final-sys-results/              ← produced by compute_final_system_metric.py
+└── nll_runs/                       ← ⬅ create this manually
+    ├── experiments_interval1_gen3.json    ← NLL output (name must start with "experiments")
+    ├── experiments_interval2_gen5.json
+    └── ...
+```
+
+The filename `experiments_<anything>.json` will be matched to CSV rows by parsing the `interval` and `gen_frame` numbers out of the filename automatically.
+
+---
+
 ### Step 1 — Compute raw NLL (in StreamMUSE repo)
 
-Run on the machine with the GPU and the trained model checkpoint. See [`src/nll_compute/README.md`](src/nll_compute/README.md) for the full workflow, but the quick-start command is:
+Run on the machine with the GPU and the trained model checkpoint. See [`src/nll_compute/README.md`](src/nll_compute/README.md) for the full workflow:
 
 ```bash
 # Run from f:\repos\StreamMUSE-1
+# Save output directly into the convention path inside eval's results folder
 uv run python -m nll_compute.runners.run_cal_nll \
-  --midi_dir /path/to/generated/midi \
+  --midi_dir /path/to/generated/interval_2_gen_frame_5/generated \
   --ckpt_path /path/to/model.ckpt \
-  --save_json_path records/nll_runs/exp1.json \
+  --save_json_path /path/to/eval/results-exp1/nll_runs/experiments_interval2_gen5.json \
   --window 384 --offset 128
 ```
 
-*(Note: `nll_compute` is a top-level package in `StreamMUSE-1`, so no prefix needed there.)*
+*(Note: `nll_compute` is a top-level package in `StreamMUSE-1`, so no `src.` prefix needed there.)*
 
 This writes a raw JSON like `{ "001.mid": { "avg_nll": 2.31, "total_nll": ..., "total_tokens": ... }, ... }`.
 
-### Step 2 — Aggregate statistics (in this repo)
+### Step 2 — Aggregate music quality + system metrics (in this repo)
 
 ```bash
 # Run from f:\repos\eval
-uv run python -m src.nll_compute.runners.run_aggregate \
-  --input records/nll_runs/exp1.json \
-  --output reports/exp1_summary.json \
-  --pretty
+uv run summarize_metrics.py results-exp1/
 ```
 
-### Step 3 — Plot heatmap across grid experiments (optional)
+This produces `results-exp1/<folder-name> music quality summary.csv` with all musical and system metrics.
 
-If you swept across parameters (e.g. `interval` × `gen_frame`), plot a 2D heatmap:
+### Step 3 — Merge NLL into the summary table
+
+```bash
+# Run from f:\repos\eval
+uv run add_nll_to_summary.py results-exp1/ -o final_experiment_results.csv
+```
+
+This reads `results-exp1/nll_runs/experiments*.json`, matches each file to the correct CSV row by `interval`/`gen_frame` in the filename, and appends two new columns:
+- `ave_nll` — unweighted mean of per-file `avg_nll`
+- `weighted_ave_nll` — token-count-weighted mean (more reliable)
+
+### Step 4 — Plot heatmap across parameter grid (optional)
+
+If you swept across `interval` × `gen_frame` combinations:
 
 ```bash
 uv run python -m src.nll_compute.runners.run_heatmap \
-  --input-dir records/nll_runs/experiments1 \
+  --input-dir results-exp1/nll_runs \
   --out reports/heatmap_exp1.png \
   --csv-out reports/heatmap_exp1.csv \
   --value-mode weighted_avg --annotate
 ```
 
-> **Where to look:** Aggregation logic → [`src/nll_compute/aggregate.py`](src/nll_compute/aggregate.py)  
+> **Where to look:** Merge logic → [`add_nll_to_summary.py`](add_nll_to_summary.py)  
+> Aggregation logic → [`src/nll_compute/aggregate.py`](src/nll_compute/aggregate.py)  
 > Heatmap logic → [`src/nll_compute/plot_nll_heatmap.py`](src/nll_compute/plot_nll_heatmap.py)  
 > Shared stats/parsing tools → [`src/eval_toolkit/`](src/eval_toolkit/README.md)
+
