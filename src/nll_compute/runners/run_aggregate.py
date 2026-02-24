@@ -2,7 +2,7 @@
 import os
 import json
 import argparse
-from move_to_eval.nll_compute.aggregate import aggregate_nll
+from nll_compute.aggregate import aggregate_nll
 
 
 def main():

@@ -1,23 +1,42 @@
-"""Aggregation utilities for per-file NLL JSONs into dataset-level statistics."""
+"""Aggregation utilities for per-file NLL JSONs into dataset-level statistics.
+
+Reads raw NLL JSON output (produced by StreamMUSE's nll_compute module)
+and produces dataset-level summary statistics using eval_toolkit.stats.
+"""
 
 from __future__ import annotations
 
-import os
 import json
-from typing import Dict, Any, Optional
-import math
-import statistics
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
+from eval_toolkit.stats import compute_stats
 
 
-def aggregate_nll(input_json: str) -> Dict[str, Any]:
-    """Read input_json and compute summary statistics.
+def aggregate_nll(input_json: Union[str, Path]) -> Dict[str, Any]:
+    """Read a raw NLL JSON file and compute summary statistics.
 
-    Returns a dict suitable for JSON serialization.
+    The input JSON is expected to have the structure produced by
+    `nll_compute.batch.make_nll_dir` in the StreamMUSE repository:
+    {
+        "<filename>": {
+            "total_nll": float,
+            "avg_nll": float,
+            "total_tokens": int
+        },
+        ...
+    }
+
+    Returns a dict with two top-level keys:
+        "summary": dataset-level aggregate statistics
+        "per_file": per-file parsed values (or error strings)
     """
-    if not os.path.exists(input_json):
+    p = Path(input_json)
+    if not p.exists():
         raise FileNotFoundError(f"Input JSON not found: {input_json}")
 
-    with open(input_json, "r", encoding="utf-8") as f:
+    with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
     files_count = len(data)
@@ -26,7 +45,7 @@ def aggregate_nll(input_json: str) -> Dict[str, Any]:
 
     avg_nll_list = []
     total_nll_list = []
-    per_file = {}
+    per_file: Dict[str, Any] = {}
 
     for fname, val in data.items():
         if not isinstance(val, dict):
@@ -50,17 +69,8 @@ def aggregate_nll(input_json: str) -> Dict[str, Any]:
 
     successful = len(avg_nll_list)
 
-    def safe_stats(xs):
-        if not xs:
-            return {"count": 0, "mean": None, "std": None, "var": None, "median": None, "min": None, "max": None}
-        mean = statistics.mean(xs)
-        var = statistics.pvariance(xs) if len(xs) > 0 else 0.0
-        std = math.sqrt(var)
-        med = statistics.median(xs)
-        return {"count": len(xs), "mean": mean, "std": std, "var": var, "median": med, "min": min(xs), "max": max(xs)}
-
-    avg_stats = safe_stats(avg_nll_list)
-    total_stats = safe_stats(total_nll_list)
+    avg_stats = compute_stats(avg_nll_list)
+    total_stats = compute_stats(total_nll_list)
 
     weighted_avg_nll: Optional[float] = None
     if total_tokens > 0:

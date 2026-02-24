@@ -2,7 +2,7 @@
 import os
 import argparse
 from pathlib import Path
-from move_to_eval.nll_compute.plot import build_pivot_table, plot_heatmap
+from nll_compute.plot_nll_heatmap import build_pivot_table, plot_heatmap
 
 
 def main(argv=None) -> int:

@@ -1,65 +1,45 @@
-# NLL Compute Toolkit (NLL计算工具箱)
+# NLL Compute — Aggregation & Visualization (NLL 聚合与可视化)
 
-This module provides tools for calculating the Negative Log-Likelihood (NLL) of MIDI files under a given model, running batch evaluations, aggregating statistics, and plotting heatmaps.
-本模块提供了一系列工具，用于计算指定模型下 MIDI 文件的负对数似然（NLL）、执行批量评估、聚合统计数据以及绘制热力图。
+This module consumes raw NLL JSON output produced by the **StreamMUSE** `nll_compute` module
+and provides aggregation statistics and heatmap visualization tools.
+*(本模块读取由 StreamMUSE 的 `nll_compute` 模块输出的原始 NLL JSON 文件，提供统计聚合和热力图可视化工具。)*
+
+> **⚠️ SPLIT DESIGN (分离式架构)**
+> **Compute** (running the model and producing raw JSONs) lives in `StreamMUSE/nll_compute/`.
+> **Aggregation & Plotting** (this module) lives here in the `eval` repository.
+> *(计算部分（跑模型生成原始 JSON）在 StreamMUSE 仓库。聚合与画图部分（本模块）在 eval 仓库。)*
 
 ## Structure (模块结构)
 
-- **`core.py`**: Core mathematical tensor logic and single-file NLL calculation.`cal_nll`
-  *(核心张量逻辑与单文件 NLL 计算 `cal_nll`)*
-- **`batch.py`**: Batch processing logic for computing metrics across entire directories.
-  *(目录级别批量计算指标的逻辑处理)*
-- **`aggregate.py`**: Metric aggregation logic mapping JSON file metrics to dataset-level statistics.
-  *(指标聚合逻辑，将 JSON 文件的度量映射到数据集级别的统计信息)*
-- **`plot.py`**: Data visualization logic building Pivot matrices into seaborn heatmaps.
-  *(数据可视化逻辑，将数据透视表构建为 Seaborn 热力图)*
+| File | Description |
+|---|---|
+| `aggregate.py` | `aggregate_nll(json_path)` — reads a raw NLL JSON, calls `eval_toolkit.stats` to produce dataset-level stats |
+| `plot_nll_heatmap.py` | Builds interval × gen_frame pivot tables and renders seaborn/matplotlib heatmaps |
+| `runners/run_aggregate.py` | CLI wrapper for `aggregate_nll` |
+| `runners/run_heatmap.py` | CLI wrapper for `plot_nll_heatmap` |
 
-## Command Line Interface Runners (命令行入口)
+## Workflow (工作流)
 
-Executable scripts are kept inside the `runners/` directory to preserve module purity. Usage instructions are available for each via the `--help` flag.
-独立的可执行脚本放在 `runners/` 目录中以保持核心模块的纯粹性。可以通过 `--help` 标志查看每个指令的使用说明。
+```
+StreamMUSE nll_compute          →   eval/src/nll_compute
+────────────────────────────────────────────────────────
+1. uv run python -m                 2. uv run python -m
+   nll_compute.runners.                nll_compute.runners.
+   run_cal_nll                         run_aggregate
+   --midi_dir /path/to/midi            --input records/nll_runs/exp1.json
+   --ckpt_path /path/model.ckpt        --output reports/summary.json
+   --save_json output/exp1.json        --pretty
 
-### 1. Evaluate an entire directory (评估整个目录)
-Calculate average/total NLLs for a folder of generated `.mid` files.
-*(计算生成的 `.mid` 文件夹的平均/总 NLL)*
-
-```bash
-python -m move_to_eval.nll_compute.runners.run_cal_nll \
-  --midi_dir /path/to/midi/dir \
-  --ckpt_path /path/to/model.ckpt \
-  --save_json_path output/results.json \
-  --window 384 --offset 128
+                                    3. uv run python -m
+                                       nll_compute.runners.
+                                       run_heatmap
+                                       --input-dir records/nll_runs/experiments1
+                                       --out reports/heatmap.png
+                                       --value-mode weighted_avg --annotate
 ```
 
-### 2. Aggregate Results (聚合结果)
-Combine metadata created by `run_cal_nll` into unified median, maximum, and weighted_average scores.
-*(将在 `run_cal_nll` 中产生的元数据统计合并为一个统一的中位数、最大值和加权平均分数。)*
+## Aggregation Output Format (聚合输出格式)
 
-```bash
-python -m move_to_eval.nll_compute.runners.run_aggregate \
-  --input output/results.json \
-  --output summary/summary.json --pretty
-```
-
-### 3. Plot Heatmap (绘制热力图)
-Parse generated sub-directory metadata mapping variables (`interval` and `gen_frame`) to graphical nodes via pivot tables.
-*(通过数据透视表解析生成的子目录映射变量（如 `interval` 和 `gen_frame`），在二维分布图中生成指标矩阵。)*
-
-```bash
-python -m move_to_eval.nll_compute.runners.run_heatmap \
-  --input-dir records/nll_runs/experiments1 \
-  --out heatmaps/chart.png \
-  --csv-out heatmaps/chart.csv \
-  --value-mode weighted_avg --annotate
-```
-
-### 4. Manifest Pipeline Orchestrator (元数据管线协调器)
-Evaluate an array of output metrics declared within `midi_dirs.json` directly. Automatically aggregates data into combinations.
-*(直接批量评估 `midi_dirs.json` 中声明的一系列测试目录组。会自动把数据进行组合汇算。)*
-
-```bash
-python -m move_to_eval.nll_compute.runners.run_from_manifest \
-  --manifest records/midi_dirs.json \
-  --ckpt /path/to/model.ckpt \
-  --out records/nll_runs
-```
+`aggregate_nll` returns a JSON-serializable dict with two keys:
+- **`summary`**: dataset-level stats (files\_count, weighted\_avg\_nll, per\_file\_stats with mean/std/p25/p50/p75 etc.)
+- **`per_file`**: per-file parsed values or error strings
