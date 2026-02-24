@@ -15,7 +15,7 @@ GEN_FRAMES=(3 5 9 15)
 PROMPT_DIR_NAME="prompt_128_gen_576"      # 用于 generated 和 groundtruth 路径的父目录名
 
 # 根目录（按你的示例调整）
-REALTIME_ROOT="/home/ubuntu/ugrip/stanleyz/AE/experiments-AE4/realtime/baseline"
+REALTIME_ROOT="/home/ubuntu/ugrip/stanleyz/AE/experiments-AE5/realtime/baseline"
 
 # 输出结果目录前缀
 OUT_ROOT="results-experiments-AE4"
@@ -60,9 +60,17 @@ for I in "${INTERVALS[@]}"; do
       "--groundtruth-dir" "${GT_DIR}"
       "--output-json" "${OUT_FILE}"
       "--melody-track-names" "${MELODY}"
-      ${EXTRA_FLAGS}
-      "--polydis-root" "${POLYDIS_ROOT}"
+      "--auto-phrase-analysis"
     )
+
+    # CMD=( "${CMD_BASE[@]}"
+    #   "--generated-dir" "${GENERATED_DIR}"
+    #   "--groundtruth-dir" "${GT_DIR}"
+    #   "--output-json" "${OUT_FILE}"
+    #   "--melody-track-names" "${MELODY}"
+    #   ${EXTRA_FLAGS}
+    #   "--polydis-root" "${POLYDIS_ROOT}"
+    # )
 
     # 打印命令
     printf "RUN: %s\n" "${CMD[*]}"
