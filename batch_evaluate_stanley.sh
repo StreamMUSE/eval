@@ -15,10 +15,10 @@ GEN_FRAMES=(3 5 9 15)
 PROMPT_DIR_NAME="prompt_128_gen_576"      # 用于 generated 和 groundtruth 路径的父目录名
 
 # 根目录（按你的示例调整）
-REALTIME_ROOT="/home/ubuntu/ugrip/stanleyz/AE/experiments-AE5/realtime/baseline"
+REALTIME_ROOT="/data/home/bowenzheng/mbzuai-projects/AE/StreamMUSE/experiments-AE0/realtime/baseline"
 
 # 输出结果目录前缀
-OUT_ROOT="results-experiments-AE4"
+OUT_ROOT="results-experiments-AE0"
 # 其它固定参数
 MELODY="Guitar"
 POLYDIS_ROOT="./icm-deep-music-generation"
