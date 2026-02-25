@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-from eval_toolkit.stats import compute_stats
+from src.eval_toolkit.stats import compute_stats
 
 
 def aggregate_nll(input_json: Union[str, Path]) -> Dict[str, Any]:
