@@ -1,0 +1,74 @@
+# StreamMUSE Experiment Analysis Configuration (Fig. 3 & Fig. 4)
+# YAML configuration used by eval/src/benchmarks/yaml_bulk_analysis.py
+# to reproduce the latency figures from the paper.
+#
+# Before running the bulk analysis, you can optionally recompute the quadratic
+# formula coefficients for your own benchmark runs:
+#
+#   cd eval
+#   uv run -m src.benchmarks.fit_latency_formulas configs/analysis_config_fig3_fig4.yaml
+#
+# This will print updated `formula:` blocks (with a, b, c, R²) for each
+# experiment; copy/paste those values into the `formula:` sections below.
+#
+# Paths below are relative to the AE root when running from eval/, i.e.
+#   cd eval
+#   uv run -m src.benchmarks.yaml_bulk_analysis configs/analysis_config_fig3_fig4.yaml
+#
+# The three experiments correspond to the deployment settings used in the paper:
+#   - Local Direct (PC-PC)
+#   - Local Network (PC-Mac)
+#   - Remote Cloud (Hyperstack-PC)
+
+experiments:
+  - path: "../StreamMUSE/experiments/local_gl_test"
+    formal_name: "Local Direct (PC-PC)"
+    description: "Direct connection between PC client and PC server"
+    formula:
+      type: "quadratic"
+      a: 0.2841
+      b: 18.5863
+      c: 44.2256
+    color: "#2E7D32"  # Dark green
+
+  - path: "../StreamMUSE/experiments/local_server_gl_test"
+    formal_name: "Local Network (PC-Mac)"
+    description: "Local network connection between PC client and Mac server"
+    formula:
+      type: "quadratic"
+      a: 0.1202
+      b: 21.2276
+      c: 34.4944
+    color: "#1976D2"  # Blue
+
+  - path: "../StreamMUSE/experiments/remote_gl_test_new"
+    formal_name: "Remote Cloud (Hyperstack-PC)"
+    description: "Remote connection between PC client and Hyperstack server"
+    formula:
+      type: "quadratic"
+      a: 0.2643
+      b: 19.0774
+      c: 38.7320
+    color: "#D32F2F"  # Red
+
+# Analysis settings
+analysis_settings:
+  anomaly_filter_percentage: 0      # Percent to remove from each tail per GL (0 = no filtering)
+  output_directory: "results/benchmarks/fig3_fig4"  # Where eval will write CSVs and plots
+  individual_analyses: true         # Whether to run individual experiment analyses
+
+# Parameter constraint analysis settings (Fig. 4)
+constraint_analysis:
+  bpm_list: [90, 120, 150]                 # BPM values for tau_tick calculation
+  percentile: 99.5                         # Fixed percentile for constraint analysis
+  generation_frames: [1, 3, 5, 7, 9, 11, 13, 15]  # Odd frames to analyze
+  inference_intervals: [1, 2, 3, 4, 5, 6, 7, 8]   # Inference interval range
+
+# Plot settings
+plot_settings:
+  shaded_area_alpha: 0.2      # Transparency for ±5% shaded area
+  line_width: 2.5             # Width of best fit lines
+  box_plot_alpha: 0.7         # Transparency for box plots
+  figure_size: [12, 8]        # Figure width, height in inches
+  dpi: 300                    # Resolution for saved plots
+

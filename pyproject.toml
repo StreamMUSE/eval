@@ -8,6 +8,10 @@ dependencies = [
     "frechet-music-distance>=1.0.0",
     "matplotlib>=3.10.7",
     "mir-eval>=0.8.2",
+    "numpy>=1.26",
+    "pyyaml>=6.0.0",
     "pandas>=2.3.3",
     "pretty-midi>=0.2.11",
+    "scipy>=1.16",
+    "seaborn>=0.13",
 ]
