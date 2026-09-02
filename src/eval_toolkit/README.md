@@ -101,6 +101,19 @@ Its stable keys have the form
 `condition=<value>__continuation_mode=<value>`. The `overall` object mixes all
 systems and is retained for audit only; it must not be used for paper tables.
 
+Within each group, paper tables must read `table_metrics`:
+
+- `ttfp_p50_ms` and `ttfp_p95_ms` are percentiles of session-level TTFP.
+- `isr_f` and `delivery_rate` are recomputed from all frame counts in the group.
+- `staleness_p50_ms` and `staleness_p95_ms` are computed directly from all
+  delivered-frame `staleness_ms` values in the group, not from per-session
+  percentiles. Missing frames are excluded from staleness and reported in
+  `missing_frames`.
+
+The adjacent `metrics` object has `metrics_scope=per_session_descriptive` and
+is retained for session-distribution auditing; its staleness summaries must not
+be copied into the paper's `Stale_50/95` columns.
+
 All currently reported `mean`, `p50`, and `p95` values are descriptive
 statistics. They are not confidence intervals. `summary.json` explicitly
 records that 95% bootstrap confidence intervals are not implemented.

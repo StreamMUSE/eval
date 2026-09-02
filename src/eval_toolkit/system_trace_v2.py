@@ -458,14 +458,86 @@ def _group_key(condition: str | None, continuation_mode: str | None) -> str:
     return f"condition={condition_label}__continuation_mode={mode_label}"
 
 
-def build_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    grouped_rows: dict[tuple[str | None, str | None], list[dict[str, Any]]] = {}
-    for row in rows:
-        identity = (
-            _group_value(row.get("condition")),
-            _group_value(row.get("continuation_mode")),
+def _group_identity(row: dict[str, Any]) -> tuple[str | None, str | None]:
+    return (
+        _group_value(row.get("condition")),
+        _group_value(row.get("continuation_mode")),
+    )
+
+
+def _table_percentile(values: Sequence[float], percentile: float) -> float | None:
+    value = _percentile(values, percentile)
+    return round(value, 6) if value is not None else None
+
+
+def _table_metrics(
+    session_rows: Sequence[dict[str, Any]],
+    frame_rows: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    ttfp_values = [
+        float(row["ttfp_ms"]) for row in session_rows if row.get("ttfp_ms") is not None
+    ]
+    delivered_frames = sum(bool(row.get("delivered")) for row in frame_rows)
+    on_time_frames = sum(bool(row.get("on_time")) for row in frame_rows)
+    window_frames = len(frame_rows)
+    missing_frames = window_frames - delivered_frames
+    staleness_values = [
+        float(row["staleness_ms"])
+        for row in frame_rows
+        if row.get("staleness_ms") is not None
+    ]
+    if len(staleness_values) != delivered_frames:
+        raise TraceValidationError(
+            "delivered per-frame rows must each contain a finite staleness_ms"
         )
+
+    return {
+        "ttfp_p50_ms": _table_percentile(ttfp_values, 50.0),
+        "ttfp_p95_ms": _table_percentile(ttfp_values, 95.0),
+        "ttfp_available_sessions": len(ttfp_values),
+        "ttfp_missing_sessions": len(session_rows) - len(ttfp_values),
+        "isr_f": on_time_frames / window_frames if window_frames else None,
+        "delivery_rate": (delivered_frames / window_frames if window_frames else None),
+        "staleness_p50_ms": _table_percentile(staleness_values, 50.0),
+        "staleness_p95_ms": _table_percentile(staleness_values, 95.0),
+        "window_frames": window_frames,
+        "delivered_frames": delivered_frames,
+        "on_time_frames": on_time_frames,
+        "missing_frames": missing_frames,
+    }
+
+
+def build_summary(
+    rows: Sequence[dict[str, Any]], frame_rows: Sequence[dict[str, Any]]
+) -> dict[str, Any]:
+    grouped_rows: dict[tuple[str | None, str | None], list[dict[str, Any]]] = {}
+    session_groups: dict[str, tuple[str | None, str | None]] = {}
+    for row in rows:
+        identity = _group_identity(row)
         grouped_rows.setdefault(identity, []).append(row)
+        session_dir = str(row.get("session_dir") or "")
+        if not session_dir:
+            raise TraceValidationError(
+                "per-session rows must contain session_dir for frame grouping"
+            )
+        previous = session_groups.get(session_dir)
+        if previous is not None and previous != identity:
+            raise TraceValidationError(
+                f"session_dir {session_dir!r} belongs to multiple summary groups"
+            )
+        session_groups[session_dir] = identity
+
+    grouped_frames: dict[tuple[str | None, str | None], list[dict[str, Any]]] = {
+        identity: [] for identity in grouped_rows
+    }
+    for frame in frame_rows:
+        session_dir = str(frame.get("session_dir") or "")
+        identity = session_groups.get(session_dir)
+        if identity is None:
+            raise TraceValidationError(
+                f"per-frame row references unknown session_dir {session_dir!r}"
+            )
+        grouped_frames[identity].append(frame)
 
     groups: dict[str, Any] = {}
     for (condition, continuation_mode), group_rows in sorted(
@@ -475,7 +547,11 @@ def build_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "condition": condition,
             "continuation_mode": continuation_mode,
             "session_count": len(group_rows),
+            "metrics_scope": "per_session_descriptive",
             "metrics": _metric_summaries(group_rows),
+            "table_metrics": _table_metrics(
+                group_rows, grouped_frames[(condition, continuation_mode)]
+            ),
         }
 
     return {
@@ -541,7 +617,7 @@ def evaluate_sessions(
     )
     if write_per_frame:
         _write_csv(output_dir / "per_frame.csv", frame_rows, PER_FRAME_FIELDS)
-    _write_json(output_dir / "summary.json", build_summary(aggregate_rows))
+    _write_json(output_dir / "summary.json", build_summary(aggregate_rows, frame_rows))
     return aggregate_rows
 
 

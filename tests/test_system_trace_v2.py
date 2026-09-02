@@ -259,10 +259,12 @@ class SystemTraceV2Tests(unittest.TestCase):
             name="standard_session",
             continuation_mode="standard",
         )
-        prompt_row, _ = evaluate_session(prompt_session)
-        standard_row, _ = evaluate_session(standard_session)
+        prompt_row, prompt_frames = evaluate_session(prompt_session)
+        standard_row, standard_frames = evaluate_session(standard_session)
 
-        summary = build_summary([prompt_row, standard_row])
+        summary = build_summary(
+            [prompt_row, standard_row], prompt_frames + standard_frames
+        )
 
         self.assertEqual(summary["overall"]["purpose"], "audit_only")
         self.assertEqual(summary["overall"]["session_count"], 2)
@@ -277,6 +279,40 @@ class SystemTraceV2Tests(unittest.TestCase):
         self.assertEqual(standard_group["session_count"], 1)
         self.assertEqual(prompt_group["metrics"]["isr_f"]["mean"], 1.0)
         self.assertEqual(standard_group["metrics"]["isr_f"]["mean"], 0.0)
+
+    def test_table_staleness_pools_frames_not_session_percentiles(self) -> None:
+        three_frame_session = self.make_session(
+            [
+                deadline(2, 10.0, 10.1),
+                deadline(3, 10.1, 10.2),
+                deadline(4, 10.2, 10.3),
+                span(2, 3, 10.1),
+                span(3, 4, 10.2),
+                span(4, 5, 10.4),
+            ],
+            name="three_frames",
+        )
+        one_frame_session = self.make_session(
+            [
+                deadline(2, 20.0, 20.1),
+                span(2, 3, 21.1),
+            ],
+            name="one_frame",
+        )
+        first_row, first_frames = evaluate_session(three_frame_session)
+        second_row, second_frames = evaluate_session(one_frame_session)
+
+        summary = build_summary([first_row, second_row], first_frames + second_frames)
+        group = summary["groups"][
+            "condition=prompt_continuation__continuation_mode=prompt_continuation"
+        ]
+
+        self.assertEqual(group["metrics"]["staleness_p50_ms"]["p50"], 500.0)
+        self.assertEqual(group["table_metrics"]["staleness_p50_ms"], 50.0)
+        self.assertEqual(group["table_metrics"]["staleness_p95_ms"], 865.0)
+        self.assertEqual(group["table_metrics"]["isr_f"], 0.5)
+        self.assertEqual(group["table_metrics"]["delivery_rate"], 1.0)
+        self.assertEqual(group["table_metrics"]["missing_frames"], 0)
 
 
 if __name__ == "__main__":
