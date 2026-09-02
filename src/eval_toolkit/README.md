@@ -217,6 +217,9 @@ interchanged.
 Offline rows must declare already-postjoin generated/GT MIDI. Their timing is
 validated but never shifted a second time, and their system scope is recorded
 as `music_quality_only`; this tool never produces offline system metrics.
+Offline GT equivalence uses track role, note count, pitch, onset, and end time,
+but deliberately ignores MIDI velocity because the four-channel corpus has no
+velocity semantics. Pitch or timing/duration changes still fail validation.
 
 ## Supported Metric Types
 

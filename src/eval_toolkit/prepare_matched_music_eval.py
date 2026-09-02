@@ -661,6 +661,22 @@ def _canonical_note_values(notes: Sequence[NoteValue]) -> tuple[tuple[Any, ...],
     )
 
 
+def _canonical_note_geometry(
+    notes: Sequence[NoteValue],
+) -> tuple[tuple[int, float, float], ...]:
+    """Canonical pitch/timing values for velocity-free 4-channel GT matching."""
+    return tuple(
+        sorted(
+            (
+                note.pitch,
+                round(note.start, 6),
+                round(note.end, 6),
+            )
+            for note in notes
+        )
+    )
+
+
 def _canonical_note_sha256(notes: Sequence[NoteValue]) -> str:
     payload = json.dumps(
         _canonical_note_values(notes),
@@ -1038,9 +1054,9 @@ def prepare_matched_music_eval(
                         raise PreparationError("complete offline row lacks MIDI paths")
                     source_generated = trial.generated_midi
                     provided_gt = _read_offline_postjoin_gt(trial.gt_midi)
-                    if _canonical_note_values(provided_gt) != _canonical_note_values(
-                        cohort_gt.accompaniment
-                    ):
+                    if _canonical_note_geometry(
+                        provided_gt
+                    ) != _canonical_note_geometry(cohort_gt.accompaniment):
                         raise PreparationError(
                             "offline postjoin_gt_midi does not match the cohort GT "
                             "post-join window"

@@ -105,6 +105,31 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
         )
         return manifest, melody, gt
 
+    @staticmethod
+    def _write_postjoin_gt(source: Path, target: Path) -> None:
+        source_midi = pretty_midi.PrettyMIDI(str(source))
+        target_midi = pretty_midi.PrettyMIDI(initial_tempo=120.0)
+        for source_track in source_midi.instruments:
+            target_track = pretty_midi.Instrument(
+                program=source_track.program,
+                is_drum=source_track.is_drum,
+                name=source_track.name,
+            )
+            for note in source_track.notes:
+                if note.end <= 4.0 or note.start >= 16.0:
+                    continue
+                target_track.notes.append(
+                    pretty_midi.Note(
+                        velocity=note.velocity,
+                        pitch=note.pitch,
+                        start=max(note.start, 4.0) - 4.0,
+                        end=min(note.end, 16.0) - 4.0,
+                    )
+                )
+            target_midi.instruments.append(target_track)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target_midi.write(str(target))
+
     def _write_realtime_manifest(
         self,
         rows: list[dict[str, str]],
@@ -615,6 +640,82 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
                     result["systems"][0]["system_scope"], "music_quality_only"
                 )
                 self.assertFalse(result["produces_system_metrics"])
+
+    def test_offline_gt_matching_ignores_only_velocity(self) -> None:
+        cohort, _, gt_full = self._cohort()
+        cases = (
+            ("velocity", True),
+            ("pitch", False),
+            ("onset", False),
+            ("duration", False),
+        )
+        for case, should_pass in cases:
+            with self.subTest(case=case):
+                case_root = self.root / f"offline-geometry-{case}"
+                postjoin_gt = case_root / "postjoin_gt.mid"
+                self._write_postjoin_gt(gt_full, postjoin_gt)
+                midi = pretty_midi.PrettyMIDI(str(postjoin_gt))
+                accompaniment = next(
+                    track for track in midi.instruments if track.name == "Accompaniment"
+                )
+                note = accompaniment.notes[0]
+                if case == "velocity":
+                    for item in accompaniment.notes:
+                        item.velocity = max(1, item.velocity - 23)
+                elif case == "pitch":
+                    note.pitch += 1
+                elif case == "onset":
+                    note.start += 0.125
+                else:
+                    note.end += 0.125
+                midi.write(str(postjoin_gt))
+
+                generated = case_root / "generated.mid"
+                self._write_midi(
+                    generated,
+                    melody=[(60, 1.0, 2.0)],
+                    accompaniment=[(48, 2.0, 3.0)],
+                )
+                offline = case_root / "offline.json"
+                offline.write_text(
+                    json.dumps(
+                        [
+                            {
+                                "piece_id": "piece-a",
+                                "seed": "0",
+                                "system_id": "beat-offline",
+                                "postjoin_generated_midi": str(generated),
+                                "postjoin_gt_midi": str(postjoin_gt),
+                                "run_status": "complete",
+                                "failure_reason": "",
+                            }
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                output = case_root / "output"
+                if should_pass:
+                    result = prepare_matched_music_eval(
+                        cohort_manifest=cohort,
+                        offline_manifest=offline,
+                        output_dir=output,
+                        expected_piece_count=1,
+                        expected_seeds=("0",),
+                    )
+                    self.assertEqual(result["preparation_status"], "success")
+                else:
+                    with self.assertRaises(PreparationBlockedError):
+                        prepare_matched_music_eval(
+                            cohort_manifest=cohort,
+                            offline_manifest=offline,
+                            output_dir=output,
+                            expected_piece_count=1,
+                            expected_seeds=("0",),
+                        )
+                    result = json.loads(
+                        (output / "prepared_manifest.json").read_text(encoding="utf-8")
+                    )
+                    self.assertIn("does not match", result["blockers"][0])
 
     def test_offline_out_of_window_and_empty_melody_are_rejected(self) -> None:
         cohort, _, _ = self._cohort()
