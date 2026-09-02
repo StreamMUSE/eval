@@ -174,6 +174,40 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
             if valid
         ]
 
+    def _common_valid_fixture(
+        self, name: str
+    ) -> tuple[
+        Path,
+        dict[str, Path],
+        set[tuple[str, str]],
+        tuple[str, str],
+    ]:
+        pieces = tuple(f"p{index:02d}" for index in range(40))
+        seeds = ("0", "1", "2")
+        all_valid = self._grid(pieces, seeds)
+        partial_valid = dict(all_valid)
+        for piece_id in pieces[:21]:
+            partial_valid[(piece_id, "0")] = False
+        audit = self._write_audit(
+            {"A": all_valid, "B": partial_valid, "C": all_valid},
+            name=f"{name}-audit.csv",
+        )
+        common_keys = {
+            key for key, valid_output in partial_valid.items() if valid_output
+        }
+        metrics_paths = {
+            system_id: self._write_metrics(
+                self.root / f"{name}-{system_id}.json",
+                [
+                    self._detail(piece_id, seed, 0.1 + offset)
+                    for piece_id, seed in sorted(common_keys)
+                ],
+                fmd=1.0 + offset,
+            )
+            for system_id, offset in (("A", 0.0), ("B", 0.1), ("C", 0.2))
+        }
+        return audit, metrics_paths, common_keys, (pieces[0], "0")
+
     def test_conditional_means_vor_fmd_and_flat_cli_output(self) -> None:
         system_a = self._grid(default=False)
         system_a[("p1", "0")] = True
@@ -222,6 +256,8 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
         )
         self.assertEqual(exit_code, 0)
         summary = json.loads(output_json.read_text(encoding="utf-8"))
+        self.assertEqual(summary["quality_scope"], "per_system_valid")
+        self.assertIsNone(summary["common_quality_trial_count"])
         metrics = summary["systems"]["A"]["metrics"]
         self.assertEqual(metrics["valid_output_rate"]["numerator"], 3)
         self.assertEqual(metrics["valid_output_rate"]["denominator"], 4)
@@ -248,6 +284,97 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
         )
         self.assertEqual(fmd_row["ci_low"], "")
         self.assertEqual(fmd_row["ci_high"], "")
+
+    def test_common_valid_intersection_uses_original_vor_and_common_quality(self) -> None:
+        audit, metrics_paths, common_keys, _excluded_key = (
+            self._common_valid_fixture("common-success")
+        )
+        output_json = self.root / "common-summary.json"
+        output_csv = self.root / "common-summary.csv"
+
+        exit_code = main(
+            [
+                "--audit",
+                str(audit),
+                *[
+                    item
+                    for system_id, path in metrics_paths.items()
+                    for item in ("--metrics", f"{system_id}={path}")
+                ],
+                "--output-json",
+                str(output_json),
+                "--output-csv",
+                str(output_csv),
+                "--quality-scope",
+                "common_valid_intersection",
+                "--bootstrap-replicates",
+                "50",
+            ]
+        )
+
+        self.assertEqual(exit_code, 0)
+        summary = json.loads(output_json.read_text(encoding="utf-8"))
+        self.assertEqual(summary["quality_scope"], "common_valid_intersection")
+        self.assertEqual(summary["common_quality_trial_count"], 99)
+        self.assertEqual(len(common_keys), 99)
+        self.assertEqual(len(summary["bootstrap"]["quality_piece_order"]), 40)
+        for system_id, original_valid_count in (("A", 120), ("B", 99), ("C", 120)):
+            system = summary["systems"][system_id]
+            self.assertEqual(
+                system["original_valid_output_count"], original_valid_count
+            )
+            self.assertEqual(system["quality_trial_count"], 99)
+            vor = system["metrics"]["valid_output_rate"]
+            self.assertEqual(vor["numerator"], original_valid_count)
+            self.assertEqual(vor["denominator"], 120)
+            self.assertAlmostEqual(vor["estimate"], original_valid_count / 120)
+            for metric in ("pitch_jsd", "onset_jsd", "duration_jsd", "cr", "ur"):
+                record = system["metrics"][metric]
+                self.assertEqual(record["denominator"], 99)
+                self.assertEqual(record["scope"], "common_valid_intersection")
+            fmd = system["metrics"]["fmd"]
+            self.assertEqual(fmd["denominator"], 99)
+            self.assertEqual(fmd["scope"], "dataset_level_common_valid_output")
+
+    def test_common_valid_intersection_rejects_non_exact_or_mismatched_inputs(
+        self,
+    ) -> None:
+        for case, expected_error in (
+            ("missing", "missing valid trials"),
+            ("extra", "unexpected metrics detail"),
+            ("hash", "does not match audit line"),
+            ("config", "matched metric_config mismatch"),
+        ):
+            with self.subTest(case=case):
+                audit, metrics_paths, _common_keys, excluded_key = (
+                    self._common_valid_fixture(f"common-{case}")
+                )
+                target_system = "C" if case == "config" else "A"
+                target_path = metrics_paths[target_system]
+                payload = json.loads(target_path.read_text(encoding="utf-8"))
+                if case == "missing":
+                    payload["details"].pop()
+                elif case == "extra":
+                    payload["details"].append(self._detail(*excluded_key, 0.4))
+                elif case == "hash":
+                    payload["details"][0]["generated_sha256"] = "f" * 64
+                else:
+                    payload["meta"]["metric_config"]["implementation_tag"] = (
+                        "different"
+                    )
+                target_path.write_text(json.dumps(payload), encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    MusicSummaryValidationError, expected_error
+                ):
+                    summarize_matched_music_metrics(
+                        audit_path=audit,
+                        metrics_paths=metrics_paths,
+                        expected_piece_count=40,
+                        expected_seeds=("0", "1", "2"),
+                        bootstrap_replicates=10,
+                        quality_scope="common_valid_intersection",
+                    )
 
     def test_empty_valid_system_is_legal_and_conditional_metrics_are_null(self) -> None:
         empty = self._grid(default=False)

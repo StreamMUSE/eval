@@ -19,6 +19,7 @@ EXPECTED_PIECE_COUNT = 40
 EXPECTED_SEEDS = ("0", "1", "2")
 DEFAULT_BOOTSTRAP_REPLICATES = 10_000
 DEFAULT_BOOTSTRAP_SEED = 0
+QUALITY_SCOPES = ("per_system_valid", "common_valid_intersection")
 FORMAL_EVALUATION_DURATION_SECONDS = 12.0
 FORMAL_DURATION_HISTOGRAM_UPPER_BOUND_SECONDS = 12.0
 DETAIL_METRICS = {
@@ -467,6 +468,7 @@ def _load_system_metrics(
     trials: Sequence[AuditTrial],
     *,
     system_id: str,
+    quality_keys: set[tuple[str, str]],
 ) -> SystemInput:
     data = _read_json(path)
     if not isinstance(data, Mapping):
@@ -485,6 +487,12 @@ def _load_system_metrics(
     valid_trials = {
         (trial.piece_id, trial.seed): trial for trial in trials if trial.valid_output
     }
+    if not quality_keys <= set(valid_trials):
+        invalid_quality_keys = sorted(quality_keys - set(valid_trials))
+        raise MusicSummaryValidationError(
+            f"quality keys for {system_id!r} include invalid-output trials: "
+            f"{invalid_quality_keys[:5]}"
+        )
     invalid_piece_names = {
         f"piece-{trial.piece_id}__seed-{trial.seed}"
         for trial in trials
@@ -492,7 +500,7 @@ def _load_system_metrics(
     }
     expected_names = {
         f"piece-{piece_id}__seed-{seed}": (piece_id, seed)
-        for piece_id, seed in valid_trials
+        for piece_id, seed in quality_keys
     }
     detail_values: dict[tuple[str, str], dict[str, float]] = {}
     seen_names: set[str] = set()
@@ -553,14 +561,15 @@ def _load_system_metrics(
         raise MusicSummaryValidationError(
             f"metrics details are missing valid trials: {missing_names[:5]}"
         )
-    valid_count = len(valid_trials)
-    if pairs != valid_count:
+    quality_count = len(quality_keys)
+    if pairs != quality_count:
         raise MusicSummaryValidationError(
-            f"{path}: meta.pairs={pairs} does not equal valid detail count {valid_count}"
+            f"{path}: meta.pairs={pairs} does not equal quality detail count "
+            f"{quality_count}"
         )
-    if len(details_raw) != valid_count:
+    if len(details_raw) != quality_count:
         raise MusicSummaryValidationError(
-            f"{path}: details count does not equal valid detail count {valid_count}"
+            f"{path}: details count does not equal quality detail count {quality_count}"
         )
 
     summary = data.get("summary")
@@ -572,17 +581,18 @@ def _load_system_metrics(
         if count is None:
             continue
         parsed_count = _strict_integer(count, f"{path}: summary {metric} count")
-        if parsed_count != valid_count:
+        if parsed_count != quality_count:
             raise MusicSummaryValidationError(
                 f"{path}: summary {metric} count {parsed_count} does not equal "
-                f"valid detail count {valid_count}"
+                f"quality detail count {quality_count}"
             )
 
     fmd_raw = _nested_optional(summary_root, FMD_PATH)
     fmd = None if fmd_raw is None else _finite_number(fmd_raw, f"{path}: FMD")
-    if fmd is not None and valid_count == 0:
+    if fmd is not None and quality_count == 0:
         raise MusicSummaryValidationError(
-            f"{path}: non-null FMD is invalid when there are zero valid details"
+            f"{path}: non-null FMD is invalid when there are zero valid details "
+            "in the requested quality scope"
         )
     return SystemInput(
         trials=tuple(trials),
@@ -628,11 +638,16 @@ def summarize_matched_music_metrics(
     expected_seeds: Sequence[str] = EXPECTED_SEEDS,
     bootstrap_replicates: int = DEFAULT_BOOTSTRAP_REPLICATES,
     bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
+    quality_scope: str = "per_system_valid",
 ) -> dict[str, Any]:
     if bootstrap_replicates <= 0:
         raise MusicSummaryValidationError("bootstrap_replicates must be positive")
     if not metrics_paths:
         raise MusicSummaryValidationError("at least one metrics system is required")
+    if quality_scope not in QUALITY_SCOPES:
+        raise MusicSummaryValidationError(
+            f"quality_scope must be one of {QUALITY_SCOPES}; found {quality_scope!r}"
+        )
     system_ids = tuple(sorted(metrics_paths))
     expected_seeds = tuple(str(seed) for seed in expected_seeds)
     audit_by_system, pieces = load_matched_audit(
@@ -641,11 +656,31 @@ def summarize_matched_music_metrics(
         expected_piece_count=expected_piece_count,
         expected_seeds=expected_seeds,
     )
+    valid_keys_by_system = {
+        system_id: {
+            (trial.piece_id, trial.seed)
+            for trial in audit_by_system[system_id]
+            if trial.valid_output
+        }
+        for system_id in system_ids
+    }
+    common_quality_keys = set.intersection(
+        *(valid_keys_by_system[system_id] for system_id in system_ids)
+    )
+    quality_keys_by_system = {
+        system_id: (
+            common_quality_keys
+            if quality_scope == "common_valid_intersection"
+            else valid_keys_by_system[system_id]
+        )
+        for system_id in system_ids
+    }
     system_inputs = {
         system_id: _load_system_metrics(
             Path(metrics_paths[system_id]).resolve(),
             audit_by_system[system_id],
             system_id=system_id,
+            quality_keys=quality_keys_by_system[system_id],
         )
         for system_id in system_ids
     }
@@ -671,28 +706,61 @@ def summarize_matched_music_metrics(
     )
     draw_hash = hashlib.sha256(draws.tobytes(order="C")).hexdigest()
     piece_to_index = {piece_id: index for index, piece_id in enumerate(pieces)}
+    if quality_scope == "common_valid_intersection":
+        quality_pieces = tuple(
+            piece_id
+            for piece_id in pieces
+            if any(key[0] == piece_id for key in common_quality_keys)
+        )
+        quality_draws = (
+            rng.integers(
+                0,
+                len(quality_pieces),
+                size=(bootstrap_replicates, len(quality_pieces)),
+                dtype=np.int64,
+            )
+            if quality_pieces
+            else np.empty((bootstrap_replicates, 0), dtype=np.int64)
+        )
+    else:
+        quality_pieces = pieces
+        quality_draws = draws
+    quality_draw_hash = hashlib.sha256(
+        quality_draws.tobytes(order="C")
+    ).hexdigest()
+    quality_piece_to_index = {
+        piece_id: index for index, piece_id in enumerate(quality_pieces)
+    }
+    detail_metric_scope = (
+        "common_valid_intersection"
+        if quality_scope == "common_valid_intersection"
+        else "conditional_on_valid_output"
+    )
     system_results: dict[str, Any] = {}
 
     for system_id in system_ids:
         system_input = system_inputs[system_id]
         piece_valid = np.zeros(len(pieces), dtype=np.int64)
         piece_metric_sums = {
-            metric: np.zeros(len(pieces), dtype=np.float64) for metric in DETAIL_METRICS
+            metric: np.zeros(len(quality_pieces), dtype=np.float64)
+            for metric in DETAIL_METRICS
         }
-        piece_metric_counts = np.zeros(len(pieces), dtype=np.int64)
+        piece_metric_counts = np.zeros(len(quality_pieces), dtype=np.int64)
         for trial in system_input.trials:
             piece_index = piece_to_index[trial.piece_id]
             if not trial.valid_output:
                 continue
             piece_valid[piece_index] += 1
+        for (piece_id, _seed), values in system_input.details.items():
+            piece_index = quality_piece_to_index[piece_id]
             piece_metric_counts[piece_index] += 1
-            values = system_input.details[(trial.piece_id, trial.seed)]
             for metric in DETAIL_METRICS:
                 piece_metric_sums[metric][piece_index] += values[metric]
 
         all_trial_count = len(system_input.trials)
-        valid_count = int(piece_valid.sum())
-        vor_estimate = valid_count / all_trial_count
+        original_valid_count = int(piece_valid.sum())
+        quality_trial_count = int(piece_metric_counts.sum())
+        vor_estimate = original_valid_count / all_trial_count
         vor_replicates: list[float] = []
         conditional_replicates: dict[str, list[float]] = {
             metric: [] for metric in DETAIL_METRICS
@@ -701,6 +769,8 @@ def summarize_matched_music_metrics(
             weights = np.bincount(draw, minlength=len(pieces))
             replicate_valid = int(weights @ piece_valid)
             vor_replicates.append(replicate_valid / all_trial_count)
+        for draw in quality_draws:
+            weights = np.bincount(draw, minlength=len(quality_pieces))
             replicate_denominator = int(weights @ piece_metric_counts)
             if replicate_denominator == 0:
                 continue
@@ -714,14 +784,14 @@ def summarize_matched_music_metrics(
                 ci=_percentile_ci(vor_replicates),
                 ci_status="computed",
                 valid_replicates=len(vor_replicates),
-                numerator=valid_count,
+                numerator=original_valid_count,
                 denominator=all_trial_count,
                 scope="all_trials",
             )
         }
         for metric in DETAIL_METRICS:
             numerator = float(piece_metric_sums[metric].sum())
-            if valid_count == 0:
+            if quality_trial_count == 0:
                 metrics[metric] = _metric_record(
                     estimate=None,
                     ci=None,
@@ -729,18 +799,18 @@ def summarize_matched_music_metrics(
                     valid_replicates=0,
                     numerator=0,
                     denominator=0,
-                    scope="conditional_on_valid_output",
+                    scope=detail_metric_scope,
                 )
                 continue
             replicates = conditional_replicates[metric]
             metrics[metric] = _metric_record(
-                estimate=numerator / valid_count,
+                estimate=numerator / quality_trial_count,
                 ci=_percentile_ci(replicates) if replicates else None,
                 ci_status="computed" if replicates else "not_computed",
                 valid_replicates=len(replicates),
                 numerator=numerator,
-                denominator=valid_count,
-                scope="conditional_on_valid_output",
+                denominator=quality_trial_count,
+                scope=detail_metric_scope,
             )
         metrics["fmd"] = _metric_record(
             estimate=system_input.fmd,
@@ -748,8 +818,12 @@ def summarize_matched_music_metrics(
             ci_status="not_computed",
             valid_replicates=0,
             numerator=None,
-            denominator=valid_count,
-            scope="dataset_level_valid_output",
+            denominator=quality_trial_count,
+            scope=(
+                "dataset_level_common_valid_output"
+                if quality_scope == "common_valid_intersection"
+                else "dataset_level_valid_output"
+            ),
         )
         system_results[system_id] = {
             "metrics_path": str(system_input.metrics_path),
@@ -759,13 +833,21 @@ def summarize_matched_music_metrics(
             "piece_count": len(pieces),
             "seed_count": len(expected_seeds),
             "trial_count": all_trial_count,
-            "valid_output_count": valid_count,
+            "valid_output_count": original_valid_count,
+            "original_valid_output_count": original_valid_count,
+            "quality_trial_count": quality_trial_count,
             "metrics": metrics,
         }
 
     return {
         "schema_version": 2,
         "audit_path": str(audit_path.resolve()),
+        "quality_scope": quality_scope,
+        "common_quality_trial_count": (
+            len(common_quality_keys)
+            if quality_scope == "common_valid_intersection"
+            else None
+        ),
         "matched_metric_config_fingerprint": matched_metric_config_fingerprint,
         "expected_grid": {
             "piece_count": expected_piece_count,
@@ -781,6 +863,8 @@ def summarize_matched_music_metrics(
             "percentiles": [2.5, 97.5],
             "piece_order": list(pieces),
             "shared_draw_matrix_sha256": draw_hash,
+            "quality_piece_order": list(quality_pieces),
+            "shared_quality_draw_matrix_sha256": quality_draw_hash,
         },
         "systems": system_results,
     }
@@ -843,6 +927,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--bootstrap-replicates", type=int, default=DEFAULT_BOOTSTRAP_REPLICATES
     )
     parser.add_argument("--bootstrap-seed", type=int, default=DEFAULT_BOOTSTRAP_SEED)
+    parser.add_argument(
+        "--quality-scope",
+        choices=QUALITY_SCOPES,
+        default="per_system_valid",
+    )
     return parser
 
 
@@ -858,6 +947,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_seeds=args.expected_seeds,
             bootstrap_replicates=args.bootstrap_replicates,
             bootstrap_seed=args.bootstrap_seed,
+            quality_scope=args.quality_scope,
         )
         write_summary_json(args.output_json, summary)
         write_flat_csv(args.output_csv, summary)

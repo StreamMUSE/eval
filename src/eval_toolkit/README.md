@@ -262,22 +262,24 @@ PYTHONPATH=src python -m eval_toolkit.summarize_matched_music_metrics \
   --audit results/matched_music/audit.csv \
   --metrics streammuse_v1=results/v1/metrics.json \
   --metrics streammuse_v2=results/v2/metrics.json \
+  --quality-scope common_valid_intersection \
   --output-json results/matched_music_summary.json \
   --output-csv results/matched_music_summary.csv
 ```
 
 The default grid is 40 pieces by seeds `0,1,2`. Valid Output Rate is
-`valid trials / all matched trials`. Pitch JSD, Onset JSD, Duration JSD, CR,
-and UR are arithmetic means conditional on `valid_output=true`; their reported
-numerator is the sum of detail values and their denominator is the valid trial
-count. Empty-valid systems retain a valid zero VOR row while conditional music
-metrics are explicitly not computed.
+`valid trials / all matched trials` for each system, regardless of quality
+scope. With `common_valid_intersection`, every metrics JSON must contain exactly
+the trial keys marked valid by all selected systems; Pitch JSD, Onset JSD,
+Duration JSD, CR, UR, and FMD therefore use the same common-valid set. The
+default `per_system_valid` mode preserves the legacy behavior in which each
+metrics JSON contains that system's own valid trials.
 
-The 95% intervals use a matched piece-cluster percentile bootstrap. One shared
-piece draw matrix is reused for every system and metric, and each selected
-piece retains all seeds. FMD is only a single dataset-level scalar over valid
-outputs, so it is reported without a bootstrap interval; a non-null FMD with
-zero valid details is rejected.
+The 95% intervals use a matched piece-cluster percentile bootstrap. Shared
+piece-draw matrices are reused across systems, and each selected piece retains
+all seeds actually present in the chosen quality set. FMD is a single
+dataset-level scalar over that set, so it is reported without a bootstrap
+interval; a non-null FMD with zero quality details is rejected.
 
 ## Supported Metric Types
 
