@@ -10,10 +10,13 @@ import argparse
 import csv
 import json
 import math
+import random
+import re
 import statistics
 import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,30 @@ TRACE_FILENAME = "system_trace.jsonl"
 CONFIG_FILENAME = "session_config.json"
 TRACE_SCHEMA_VERSION = 2
 AUDIT_FIELDS = ("condition", "mode", "clock_domain")
+EXPECTED_PIECE_COUNT = 40
+EXPECTED_SEED_COUNT = 3
+DEFAULT_BOOTSTRAP_REPLICATES = 10_000
+DEFAULT_BOOTSTRAP_SEED = 0
+MANIFEST_REQUIRED_FIELDS = (
+    "piece_id",
+    "seed",
+    "system_id",
+    "session_dir",
+    "run_status",
+    "melody_input_sha256",
+    "failure_reason",
+)
+MANIFEST_RUN_STATUSES = {"complete", "failed", "missing"}
+BOOTSTRAP_METRICS = (
+    "ttfp_p50_ms",
+    "ttfp_p95_ms",
+    "isr_f",
+    "delivery_rate",
+    "staleness_p50_ms",
+    "staleness_p95_ms",
+    "missing_frames",
+)
+_SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class TraceValidationError(ValueError):
@@ -46,6 +73,19 @@ class ParsedTrace:
     deadlines: dict[int, FrameDeadline]
     spans: tuple[AvailabilitySpan, ...]
     audit: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ManifestEntry:
+    piece_id: str
+    seed: str
+    system_id: str
+    session_dir: Path | None
+    session_dir_raw: str
+    run_status: str
+    melody_input_sha256: str
+    failure_reason: str
+    line_number: int
 
 
 PER_SESSION_FIELDS = (
@@ -84,6 +124,15 @@ PER_FRAME_FIELDS = (
     "delivered",
     "on_time",
     "staleness_ms",
+)
+
+MANIFEST_AUDIT_FIELDS = MANIFEST_REQUIRED_FIELDS + (
+    "resolved_session_dir",
+    "evaluation_status",
+    "evaluation_error",
+    "condition",
+    "continuation_mode",
+    "session_id",
 )
 
 SUMMARY_METRICS = (
@@ -428,6 +477,204 @@ def discover_sessions(
     return sessions
 
 
+def _manifest_value(
+    row: dict[str, str | None], field: str, path: Path, line_number: int
+) -> str:
+    value = row.get(field)
+    if value is None:
+        raise _context(path, line_number, f"manifest field {field!r} is missing")
+    return value.strip()
+
+
+def load_manifest(
+    path: Path,
+    *,
+    expected_piece_count: int = EXPECTED_PIECE_COUNT,
+    expected_seed_count: int = EXPECTED_SEED_COUNT,
+) -> list[ManifestEntry]:
+    """Load and validate a complete matched piece x seed x system manifest."""
+    path = Path(path)
+    try:
+        handle = path.open("r", encoding="utf-8-sig", newline="")
+    except OSError as exc:
+        raise _context(path, None, f"cannot read manifest: {exc}") from exc
+
+    entries: list[ManifestEntry] = []
+    try:
+        with handle:
+            reader = csv.DictReader(handle)
+            fields = reader.fieldnames
+            if fields is None:
+                raise _context(path, None, "manifest has no header")
+            if len(fields) != len(set(fields)):
+                raise _context(path, None, "manifest header contains duplicate columns")
+            missing_fields = [
+                field for field in MANIFEST_REQUIRED_FIELDS if field not in fields
+            ]
+            if missing_fields:
+                raise _context(
+                    path,
+                    None,
+                    "manifest is missing required columns: "
+                    + ", ".join(missing_fields),
+                )
+
+            for line_number, row in enumerate(reader, start=2):
+                if not any(str(value or "").strip() for value in row.values()):
+                    continue
+                piece_id = _manifest_value(row, "piece_id", path, line_number)
+                seed = _manifest_value(row, "seed", path, line_number)
+                system_id = _manifest_value(row, "system_id", path, line_number)
+                session_dir_raw = _manifest_value(row, "session_dir", path, line_number)
+                run_status = _manifest_value(
+                    row, "run_status", path, line_number
+                ).lower()
+                melody_hash = _manifest_value(
+                    row, "melody_input_sha256", path, line_number
+                ).lower()
+                failure_reason = _manifest_value(
+                    row, "failure_reason", path, line_number
+                )
+
+                for field, value in (
+                    ("piece_id", piece_id),
+                    ("seed", seed),
+                    ("system_id", system_id),
+                ):
+                    if not value:
+                        raise _context(
+                            path, line_number, f"manifest field {field!r} is empty"
+                        )
+                if run_status not in MANIFEST_RUN_STATUSES:
+                    allowed = ", ".join(sorted(MANIFEST_RUN_STATUSES))
+                    raise _context(
+                        path,
+                        line_number,
+                        f"run_status must be one of: {allowed}",
+                    )
+                if not _SHA256_PATTERN.fullmatch(melody_hash):
+                    raise _context(
+                        path,
+                        line_number,
+                        "melody_input_sha256 must contain exactly 64 hex digits",
+                    )
+                if run_status == "complete" and not session_dir_raw:
+                    raise _context(
+                        path,
+                        line_number,
+                        "complete manifest rows require session_dir",
+                    )
+                if run_status in {"failed", "missing"} and not failure_reason:
+                    raise _context(
+                        path,
+                        line_number,
+                        f"{run_status} manifest rows require failure_reason",
+                    )
+
+                session_dir: Path | None = None
+                if session_dir_raw:
+                    raw_path = Path(session_dir_raw).expanduser()
+                    session_dir = (
+                        raw_path if raw_path.is_absolute() else path.parent / raw_path
+                    ).resolve()
+                entries.append(
+                    ManifestEntry(
+                        piece_id=piece_id,
+                        seed=seed,
+                        system_id=system_id,
+                        session_dir=session_dir,
+                        session_dir_raw=session_dir_raw,
+                        run_status=run_status,
+                        melody_input_sha256=melody_hash,
+                        failure_reason=failure_reason,
+                        line_number=line_number,
+                    )
+                )
+    except csv.Error as exc:
+        raise _context(path, None, f"invalid manifest CSV: {exc}") from exc
+
+    if not entries:
+        raise _context(path, None, "manifest contains no data rows")
+
+    keys: dict[tuple[str, str, str], ManifestEntry] = {}
+    session_paths: dict[str, ManifestEntry] = {}
+    for entry in entries:
+        key = (entry.piece_id, entry.seed, entry.system_id)
+        previous = keys.get(key)
+        if previous is not None:
+            raise _context(
+                path,
+                entry.line_number,
+                "duplicate (piece_id, seed, system_id); first seen at line "
+                f"{previous.line_number}",
+            )
+        keys[key] = entry
+        if entry.session_dir is not None:
+            session_key = str(entry.session_dir).casefold()
+            reused = session_paths.get(session_key)
+            if reused is not None:
+                raise _context(
+                    path,
+                    entry.line_number,
+                    f"session_dir is reused from manifest line {reused.line_number}",
+                )
+            session_paths[session_key] = entry
+
+    pieces = sorted({entry.piece_id for entry in entries})
+    seeds = sorted({entry.seed for entry in entries})
+    systems = sorted({entry.system_id for entry in entries})
+    if len(pieces) != expected_piece_count:
+        raise _context(
+            path,
+            None,
+            f"manifest must contain exactly {expected_piece_count} pieces; "
+            f"found {len(pieces)}",
+        )
+    if len(seeds) != expected_seed_count:
+        raise _context(
+            path,
+            None,
+            f"manifest must contain exactly {expected_seed_count} seeds; "
+            f"found {len(seeds)}",
+        )
+    if len(systems) < 2:
+        raise _context(path, None, "manifest must contain at least two systems")
+
+    expected_keys = {
+        (piece_id, seed, system_id)
+        for piece_id in pieces
+        for seed in seeds
+        for system_id in systems
+    }
+    missing_keys = sorted(expected_keys - set(keys))
+    if missing_keys:
+        preview = ", ".join("/".join(key) for key in missing_keys[:5])
+        suffix = "..." if len(missing_keys) > 5 else ""
+        raise _context(
+            path,
+            None,
+            f"manifest matched grid is incomplete; missing: {preview}{suffix}",
+        )
+
+    hashes_by_piece: dict[str, set[str]] = {}
+    for entry in entries:
+        hashes_by_piece.setdefault(entry.piece_id, set()).add(entry.melody_input_sha256)
+    mismatched_pieces = sorted(
+        piece_id for piece_id, hashes in hashes_by_piece.items() if len(hashes) != 1
+    )
+    if mismatched_pieces:
+        raise _context(
+            path,
+            None,
+            "melody_input_sha256 differs within pieces: "
+            + ", ".join(mismatched_pieces[:8]),
+        )
+
+    return sorted(
+        entries, key=lambda entry: (entry.piece_id, entry.seed, entry.system_id)
+    )
+
+
 def _descriptive(values: Sequence[float | int | None]) -> dict[str, Any]:
     numeric = [float(value) for value in values if value is not None]
     return {
@@ -588,6 +835,359 @@ def _write_csv(
         writer.writerows(rows)
 
 
+def _count_values(values: Iterable[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _difference(first: Any, second: Any) -> float | None:
+    if first is None or second is None:
+        return None
+    return round(float(first) - float(second), 12)
+
+
+def _ci_payload(
+    estimate: float | None,
+    replicate_values: Sequence[float],
+    requested_replicates: int,
+) -> dict[str, Any]:
+    return {
+        "estimate": estimate,
+        "ci95_low": _table_percentile(replicate_values, 2.5),
+        "ci95_high": _table_percentile(replicate_values, 97.5),
+        "valid_replicates": len(replicate_values),
+        "requested_replicates": requested_replicates,
+    }
+
+
+def _piece_cluster_bootstrap(
+    *,
+    pieces: Sequence[str],
+    systems: Sequence[str],
+    cluster_sessions: dict[tuple[str, str], list[dict[str, Any]]],
+    cluster_frames: dict[tuple[str, str], list[dict[str, Any]]],
+    point_metrics: dict[str, dict[str, Any]],
+    replicates: int,
+    seed: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    rng = random.Random(seed)
+    system_replicates: dict[str, dict[str, list[float]]] = {
+        system_id: {metric: [] for metric in BOOTSTRAP_METRICS} for system_id in systems
+    }
+    pair_replicates: dict[tuple[str, str], dict[str, list[float]]] = {
+        pair: {metric: [] for metric in BOOTSTRAP_METRICS}
+        for pair in combinations(systems, 2)
+    }
+
+    for _ in range(replicates):
+        draw = [pieces[rng.randrange(len(pieces))] for _ in pieces]
+        replicate_metrics: dict[str, dict[str, Any]] = {}
+        for system_id in systems:
+            sampled_sessions: list[dict[str, Any]] = []
+            sampled_frames: list[dict[str, Any]] = []
+            for piece_id in draw:
+                sampled_sessions.extend(cluster_sessions[(system_id, piece_id)])
+                sampled_frames.extend(cluster_frames[(system_id, piece_id)])
+            metrics = _table_metrics(sampled_sessions, sampled_frames)
+            replicate_metrics[system_id] = metrics
+            for metric in BOOTSTRAP_METRICS:
+                value = metrics.get(metric)
+                if value is not None:
+                    system_replicates[system_id][metric].append(float(value))
+
+        for first, second in combinations(systems, 2):
+            for metric in BOOTSTRAP_METRICS:
+                value = _difference(
+                    replicate_metrics[first].get(metric),
+                    replicate_metrics[second].get(metric),
+                )
+                if value is not None:
+                    pair_replicates[(first, second)][metric].append(value)
+
+    system_ci = {
+        system_id: {
+            metric: _ci_payload(
+                point_metrics[system_id].get(metric),
+                system_replicates[system_id][metric],
+                replicates,
+            )
+            for metric in BOOTSTRAP_METRICS
+        }
+        for system_id in systems
+    }
+    paired: dict[str, Any] = {}
+    for first, second in combinations(systems, 2):
+        key = f"{first}__minus__{second}"
+        paired[key] = {
+            "minuend_system_id": first,
+            "subtrahend_system_id": second,
+            "metrics": {
+                metric: _ci_payload(
+                    _difference(
+                        point_metrics[first].get(metric),
+                        point_metrics[second].get(metric),
+                    ),
+                    pair_replicates[(first, second)][metric],
+                    replicates,
+                )
+                for metric in BOOTSTRAP_METRICS
+            },
+        }
+    return system_ci, paired
+
+
+def evaluate_manifest(
+    manifest_path: Path,
+    output_dir: Path,
+    *,
+    observation_tick: int,
+    end_tick: int,
+    bootstrap_replicates: int = DEFAULT_BOOTSTRAP_REPLICATES,
+    bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
+    write_per_frame: bool = False,
+    expected_piece_count: int = EXPECTED_PIECE_COUNT,
+    expected_seed_count: int = EXPECTED_SEED_COUNT,
+) -> dict[str, Any]:
+    """Evaluate a fixed matched grid and optionally compute formal cluster CIs."""
+    if (
+        isinstance(observation_tick, bool)
+        or not isinstance(observation_tick, int)
+        or observation_tick < 0
+    ):
+        raise TraceValidationError("observation tick must be a non-negative integer")
+    if (
+        isinstance(end_tick, bool)
+        or not isinstance(end_tick, int)
+        or end_tick <= observation_tick
+    ):
+        raise TraceValidationError(
+            "end tick must be an integer greater than observation tick"
+        )
+    if (
+        isinstance(bootstrap_replicates, bool)
+        or not isinstance(bootstrap_replicates, int)
+        or bootstrap_replicates <= 0
+    ):
+        raise TraceValidationError("bootstrap replicates must be a positive integer")
+    if isinstance(bootstrap_seed, bool) or not isinstance(bootstrap_seed, int):
+        raise TraceValidationError("bootstrap seed must be an integer")
+
+    manifest_path = Path(manifest_path).resolve()
+    entries = load_manifest(
+        manifest_path,
+        expected_piece_count=expected_piece_count,
+        expected_seed_count=expected_seed_count,
+    )
+    pieces = sorted({entry.piece_id for entry in entries})
+    seeds = sorted({entry.seed for entry in entries})
+    systems = sorted({entry.system_id for entry in entries})
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    aggregate_rows: list[dict[str, Any]] = []
+    frame_rows: list[dict[str, Any]] = []
+    audit_rows: list[dict[str, Any]] = []
+    system_sessions: dict[str, list[dict[str, Any]]] = {
+        system_id: [] for system_id in systems
+    }
+    system_frames: dict[str, list[dict[str, Any]]] = {
+        system_id: [] for system_id in systems
+    }
+    cluster_sessions: dict[tuple[str, str], list[dict[str, Any]]] = {
+        (system_id, piece_id): [] for system_id in systems for piece_id in pieces
+    }
+    cluster_frames: dict[tuple[str, str], list[dict[str, Any]]] = {
+        (system_id, piece_id): [] for system_id in systems for piece_id in pieces
+    }
+
+    for entry in entries:
+        audit = {
+            "piece_id": entry.piece_id,
+            "seed": entry.seed,
+            "system_id": entry.system_id,
+            "session_dir": entry.session_dir_raw,
+            "run_status": entry.run_status,
+            "melody_input_sha256": entry.melody_input_sha256,
+            "failure_reason": entry.failure_reason,
+            "resolved_session_dir": (
+                str(entry.session_dir) if entry.session_dir is not None else ""
+            ),
+            "evaluation_status": entry.run_status,
+            "evaluation_error": "",
+            "condition": "",
+            "continuation_mode": "",
+            "session_id": "",
+        }
+        if entry.run_status == "complete":
+            assert entry.session_dir is not None
+            try:
+                aggregate, frames = evaluate_session(
+                    entry.session_dir,
+                    observation_tick=observation_tick,
+                    end_tick=end_tick,
+                )
+            except TraceValidationError as exc:
+                audit["evaluation_status"] = "invalid_complete"
+                audit["evaluation_error"] = str(exc)
+            else:
+                audit["evaluation_status"] = "evaluated"
+                audit["condition"] = aggregate.get("condition") or ""
+                audit["continuation_mode"] = aggregate.get("continuation_mode") or ""
+                audit["session_id"] = aggregate.get("session_id") or ""
+                aggregate_rows.append(aggregate)
+                frame_rows.extend(frames)
+                system_sessions[entry.system_id].append(aggregate)
+                system_frames[entry.system_id].extend(frames)
+                cluster_sessions[(entry.system_id, entry.piece_id)].append(aggregate)
+                cluster_frames[(entry.system_id, entry.piece_id)].extend(frames)
+        audit_rows.append(audit)
+
+    for system_id in systems:
+        identities = {_group_identity(row) for row in system_sessions[system_id]}
+        if len(identities) > 1:
+            shown = ", ".join(
+                _group_key(*identity)
+                for identity in sorted(
+                    identities, key=lambda identity: _group_key(*identity)
+                )
+            )
+            raise TraceValidationError(
+                f"system_id {system_id!r} maps to inconsistent conditions: {shown}"
+            )
+
+    _write_csv(output_dir / "manifest_audit.csv", audit_rows, MANIFEST_AUDIT_FIELDS)
+    _write_csv(output_dir / "per_session.csv", aggregate_rows, PER_SESSION_FIELDS)
+    _write_json(
+        output_dir / "per_session.json",
+        {
+            "schema_version": TRACE_SCHEMA_VERSION,
+            "metric_contract": "matched_system_metrics_v2",
+            "sessions": aggregate_rows,
+        },
+    )
+    if write_per_frame:
+        _write_csv(output_dir / "per_frame.csv", frame_rows, PER_FRAME_FIELDS)
+
+    manifest_status_counts = _count_values(entry.run_status for entry in entries)
+    evaluation_status_counts = _count_values(
+        str(row["evaluation_status"]) for row in audit_rows
+    )
+    blockers: list[str] = []
+    noncomplete_count = sum(
+        count
+        for status, count in manifest_status_counts.items()
+        if status != "complete"
+    )
+    invalid_complete_count = evaluation_status_counts.get("invalid_complete", 0)
+    if noncomplete_count:
+        blockers.append(f"{noncomplete_count} manifest rows are failed or missing")
+    if invalid_complete_count:
+        blockers.append(
+            f"{invalid_complete_count} complete rows have invalid schema-v2 sessions"
+        )
+    primary_ci_eligible = not blockers
+
+    point_metrics = {
+        system_id: _table_metrics(system_sessions[system_id], system_frames[system_id])
+        for system_id in systems
+    }
+    groups: dict[str, Any] = {}
+    for system_id in systems:
+        identities = {_group_identity(row) for row in system_sessions[system_id]}
+        condition, continuation_mode = (
+            next(iter(identities)) if identities else (None, None)
+        )
+        system_entries = [entry for entry in entries if entry.system_id == system_id]
+        system_audit = [row for row in audit_rows if row["system_id"] == system_id]
+        groups[system_id] = {
+            "system_id": system_id,
+            "condition": condition,
+            "continuation_mode": continuation_mode,
+            "planned_session_count": len(system_entries),
+            "evaluated_session_count": len(system_sessions[system_id]),
+            "manifest_status_counts": _count_values(
+                entry.run_status for entry in system_entries
+            ),
+            "evaluation_status_counts": _count_values(
+                str(row["evaluation_status"]) for row in system_audit
+            ),
+            "point_estimate_scope": (
+                "all_planned_sessions"
+                if primary_ci_eligible
+                else "evaluable_complete_sessions_only"
+            ),
+            "metrics_scope": "per_session_descriptive",
+            "metrics": _metric_summaries(system_sessions[system_id]),
+            "table_metrics": point_metrics[system_id],
+        }
+
+    paired: dict[str, Any] = {}
+    if primary_ci_eligible:
+        system_ci, paired = _piece_cluster_bootstrap(
+            pieces=pieces,
+            systems=systems,
+            cluster_sessions=cluster_sessions,
+            cluster_frames=cluster_frames,
+            point_metrics=point_metrics,
+            replicates=bootstrap_replicates,
+            seed=bootstrap_seed,
+        )
+        for system_id in systems:
+            groups[system_id]["bootstrap_ci"] = system_ci[system_id]
+    else:
+        reason = "; ".join(blockers)
+        for system_id in systems:
+            groups[system_id]["bootstrap_ci"] = {
+                "computed": False,
+                "reason": reason,
+            }
+
+    summary = {
+        "schema_version": TRACE_SCHEMA_VERSION,
+        "metric_contract": "matched_system_piece_cluster_bootstrap_v1",
+        "statistics": (
+            "descriptive_with_piece_cluster_bootstrap"
+            if primary_ci_eligible
+            else "descriptive_only_primary_ci_blocked"
+        ),
+        "group_by": ["system_id"],
+        "manifest": {
+            "path": str(manifest_path),
+            "piece_count": len(pieces),
+            "seed_count": len(seeds),
+            "system_count": len(systems),
+            "planned_trial_count": len(entries),
+            "manifest_status_counts": manifest_status_counts,
+            "evaluation_status_counts": evaluation_status_counts,
+            "primary_ci_eligible": primary_ci_eligible,
+            "primary_ci_blockers": blockers,
+        },
+        "bootstrap_confidence_intervals": {
+            "computed": primary_ci_eligible,
+            "method": "matched_piece_cluster_percentile",
+            "confidence_level": 0.95,
+            "cluster_unit": "piece_id",
+            "piece_draws_are_shared_across_systems": True,
+            "all_seeds_and_frames_retained_per_piece": True,
+            "replicates": bootstrap_replicates,
+            "seed": bootstrap_seed,
+            "reason": None if primary_ci_eligible else "; ".join(blockers),
+        },
+        "overall": {
+            "purpose": "audit_only",
+            "planned_session_count": len(entries),
+            "evaluated_session_count": len(aggregate_rows),
+            "metrics": _metric_summaries(aggregate_rows),
+        },
+        "groups": groups,
+        "paired_system_differences": paired,
+    }
+    _write_json(output_dir / "summary.json", summary)
+    return summary
+
+
 def evaluate_sessions(
     sessions: Sequence[Path],
     output_dir: Path,
@@ -639,9 +1239,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Recursively discover system_trace.jsonl files below this root; repeatable.",
     )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="Formal matched-grid CSV manifest; cannot be combined with --root or --session-dir.",
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--observation-tick", type=int)
     parser.add_argument("--end-tick", type=int)
+    parser.add_argument(
+        "--bootstrap-replicates",
+        type=int,
+        default=DEFAULT_BOOTSTRAP_REPLICATES,
+        help=f"Piece-cluster bootstrap replicates (default: {DEFAULT_BOOTSTRAP_REPLICATES}).",
+    )
+    parser.add_argument(
+        "--bootstrap-seed",
+        type=int,
+        default=DEFAULT_BOOTSTRAP_SEED,
+        help=f"Deterministic piece-draw seed (default: {DEFAULT_BOOTSTRAP_SEED}).",
+    )
     parser.add_argument(
         "--per-frame",
         action="store_true",
@@ -653,7 +1270,36 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.manifest is not None and (args.session_dir or args.root):
+        parser.error("--manifest cannot be combined with --root or --session-dir")
+    if args.manifest is not None and (
+        args.observation_tick is None or args.end_tick is None
+    ):
+        parser.error("--manifest requires explicit --observation-tick and --end-tick")
     try:
+        if args.manifest is not None:
+            summary = evaluate_manifest(
+                args.manifest,
+                args.output_dir,
+                observation_tick=args.observation_tick,
+                end_tick=args.end_tick,
+                bootstrap_replicates=args.bootstrap_replicates,
+                bootstrap_seed=args.bootstrap_seed,
+                write_per_frame=args.per_frame,
+            )
+            if not summary["bootstrap_confidence_intervals"]["computed"]:
+                reason = summary["bootstrap_confidence_intervals"]["reason"]
+                print(
+                    f"error: manifest audit written, but primary CI is blocked: {reason}",
+                    file=sys.stderr,
+                )
+                return 2
+            print(
+                f"Evaluated matched manifest with {summary['manifest']['piece_count']} "
+                f"pieces; results written to {args.output_dir}"
+            )
+            return 0
+
         sessions = discover_sessions(args.session_dir, args.root)
         evaluate_sessions(
             sessions,

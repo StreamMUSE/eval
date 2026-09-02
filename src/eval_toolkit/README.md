@@ -114,9 +114,55 @@ The adjacent `metrics` object has `metrics_scope=per_session_descriptive` and
 is retained for session-distribution auditing; its staleness summaries must not
 be copied into the paper's `Stale_50/95` columns.
 
-All currently reported `mean`, `p50`, and `p95` values are descriptive
-statistics. They are not confidence intervals. `summary.json` explicitly
-records that 95% bootstrap confidence intervals are not implemented.
+In legacy `--root` / `--session-dir` mode, all reported `mean`, `p50`, and
+`p95` values are descriptive statistics. They are not confidence intervals.
+
+### Formal matched manifest and confidence intervals
+
+Formal comparison uses a CSV manifest with these required columns:
+
+```text
+piece_id,seed,system_id,session_dir,run_status,melody_input_sha256,failure_reason
+```
+
+The manifest must contain the complete Cartesian grid of 40 pieces, 3 seeds,
+and every declared system. All rows for one `piece_id` must have the same
+SHA-256 melody hash. `run_status` is `complete`, `failed`, or `missing`.
+Complete rows require a session directory and are strictly evaluated as schema
+v2. Failed and missing trials remain in `manifest_audit.csv` and require a
+failure reason; either status, or an invalid complete session, blocks primary
+confidence intervals rather than silently dropping the trial. In that case,
+the CLI writes the audit and descriptive outputs, then returns a non-zero exit
+status.
+
+Manifest mode requires one fixed evaluation window for every trial:
+
+```bash
+PYTHONPATH=src python -m eval_toolkit.system_trace_v2 \
+  --manifest /path/to/manifest.csv \
+  --observation-tick 32 \
+  --end-tick 128 \
+  --bootstrap-replicates 10000 \
+  --bootstrap-seed 0 \
+  --output-dir results/matched_system \
+  --per-frame
+```
+
+`--manifest` is mutually exclusive with `--root` and `--session-dir`.
+Manifest-relative session paths are resolved relative to the manifest file.
+In `summary.json`, formal table rows are keyed directly by `system_id` under
+`groups`. Each group contains its `table_metrics` point estimate and
+`bootstrap_ci` entries with the 2.5th/97.5th percentile interval and the number
+of valid replicates. `paired_system_differences` reports matched differences
+as `first system - second system`.
+
+The bootstrap samples `piece_id` clusters with replacement. A sampled piece
+retains all of its seeds, sessions, and frames, and every system uses the same
+piece draw in a replicate. TTFP is recomputed from session-level values; ISR
+and delivery rate are recomputed from pooled frame counts; staleness p50/p95
+are recomputed directly from delivered frames. Missing frames are never
+inserted as infinite staleness. These intervals are available only in valid
+manifest mode; the legacy mode remains descriptive-only.
 
 ## Supported Metric Types
 
