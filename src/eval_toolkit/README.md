@@ -227,6 +227,34 @@ end time while ignoring velocity; a false value does not block publication.
 Metric-ready GT is always rebuilt from the cohort, never from offline
 round-trip MIDI.
 
+### Summarize matched music metrics
+
+`summarize_matched_music_metrics.py` joins the preparation audit with one
+`evaluate_accompaniment_metrics.py` JSON per system, validates exact
+piece/seed/detail alignment, and reports formal matched confidence intervals:
+
+```bash
+PYTHONPATH=src python -m eval_toolkit.summarize_matched_music_metrics \
+  --audit results/matched_music/audit.csv \
+  --metrics streammuse_v1=results/v1/metrics.json \
+  --metrics streammuse_v2=results/v2/metrics.json \
+  --output-json results/matched_music_summary.json \
+  --output-csv results/matched_music_summary.csv
+```
+
+The default grid is 40 pieces by seeds `0,1,2`. Valid Output Rate is
+`valid trials / all matched trials`. Pitch JSD, Onset JSD, Duration JSD, CR,
+and UR are arithmetic means conditional on `valid_output=true`; their reported
+numerator is the sum of detail values and their denominator is the valid trial
+count. Empty-valid systems retain a valid zero VOR row while conditional music
+metrics are explicitly not computed.
+
+The 95% intervals use a matched piece-cluster percentile bootstrap. One shared
+piece draw matrix is reused for every system and metric, and each selected
+piece retains all seeds. FMD is only a single dataset-level scalar over valid
+outputs, so it is reported without a bootstrap interval; a non-null FMD with
+zero valid details is rejected.
+
 ## Supported Metric Types
 
 | Group | Types |
