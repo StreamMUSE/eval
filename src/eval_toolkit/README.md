@@ -164,6 +164,60 @@ are recomputed directly from delivered frames. Missing frames are never
 inserted as infinite staleness. These intervals are available only in valid
 manifest mode; the legacy mode remains descriptive-only.
 
+### Prepare matched post-join music-quality inputs
+
+`prepare_matched_music_eval.py` converts realtime `combined.mid` exports and an
+optional future offline manifest into exactly matched post-join MIDI pairs. It
+uses the fixed 120 BPM window `[8, 32)` beats (`[4, 16)` seconds), clips notes
+that cross either boundary, and shifts the prepared window to `[0, 12]`
+seconds. The realtime manifest accepts the evaluator's `run_status` and
+`melody_input_sha256` columns; the strict aliases `status` and `hash` are also
+accepted, but supplying both names for one field is rejected. Hashes are file
+SHA-256 values and are checked against `melody_midi_sha256`; canonical event
+hashes are not interchangeable. Cohort Melody and GT file hashes are both
+verified. The cohort Melody MIDI must contain exactly one non-empty named
+`Melody` instrument, no other non-empty music instruments, and a non-empty
+post-join window. Its cropped Melody events must exactly match the cropped
+Melody events in the cohort GT.
+
+```bash
+PYTHONPATH=src python -m eval_toolkit.prepare_matched_music_eval \
+  --cohort-manifest /path/to/cohort_manifest.json \
+  --realtime-manifest /path/to/eval_manifest.csv \
+  --offline-manifest /path/to/offline_trials.json \
+  --output-dir results/matched_music
+```
+
+The default matched grid is 40 pieces by seeds `0,1,2`; smoke tests can use
+`--expected-piece-count` and `--expected-seeds`. Failed, missing, malformed,
+or unmatched trials remain in `audit.csv`, block publication of the paired
+directories, and return a non-zero status. In a blocked batch all actual
+published-target path fields are null/blank; no audit row points at a staging
+file that was never published.
+
+Each system has two explicit collections:
+
+- `all_trials/` retains every complete trial, including legal REST-only or
+  empty-accompaniment results. `prepared_manifest.json` reports
+  `generated_acc_note_count`, `valid_output`, and the all-trial denominator for
+  Valid Output Rate.
+- `valid_only/` contains only basename-matched trials with at least one
+  generated accompaniment note. Existing music metrics run on this explicitly
+  conditional subset (`music_metrics_scope=conditional_on_valid_output`). Its
+  `generated/` and `groundtruth/` directories are created even when the subset
+  is empty, so a zero-valid-output system remains an explicit empty set.
+
+Generated MIDI keeps Melody and Accompaniment content. Metric-ready GT is
+accompaniment-only and its sole instrument is named `Piano`, matching the
+legacy evaluator contract; the full cohort GT remains referenced in the audit.
+For offline rows, `source_gt_midi` and `source_gt_sha256` identify the supplied
+post-join GT file, while `cohort_full_gt_midi` and `cohort_full_gt_sha256`
+identify the independently verified cohort source; the two hashes are never
+interchanged.
+Offline rows must declare already-postjoin generated/GT MIDI. Their timing is
+validated but never shifted a second time, and their system scope is recorded
+as `music_quality_only`; this tool never produces offline system metrics.
+
 ## Supported Metric Types
 
 | Group | Types |
