@@ -20,6 +20,7 @@ from eval_toolkit.prepare_matched_music_eval import (
     main,
     prepare_matched_music_eval,
 )
+from evaluate_accompaniment_metrics import _build_parser, evaluate_pair
 
 
 class PrepareMatchedMusicEvalTest(unittest.TestCase):
@@ -188,7 +189,7 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
             session / "combined.mid",
             melody=[
                 (55, 1.0, 2.0),
-                (60, 3.0, 5.0),
+                (61, 3.0, 5.0),
                 (62, 8.0, 9.0),
                 (64, 15.5, 17.0),
             ],
@@ -243,6 +244,9 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
         self.assertAlmostEqual(clipped_start.end, 1.0, places=5)
         self.assertAlmostEqual(clipped_end.start, 11.5, places=5)
         self.assertAlmostEqual(clipped_end.end, 12.0, places=5)
+        canonical_middle = next(note for note in melody_notes if note.pitch == 62)
+        self.assertAlmostEqual(canonical_middle.start, 3.0, places=5)
+        self.assertAlmostEqual(canonical_middle.end, 4.0, places=5)
         all_notes = [
             note for track in generated_midi.instruments for note in track.notes
         ]
@@ -261,6 +265,27 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
         row = manifest["trials"][0]
         self.assertEqual(row["cohort_postjoin_melody_note_count"], 3)
         self.assertRegex(row["cohort_postjoin_melody_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(row["source_exported_mel_note_count"], 3)
+        self.assertEqual(row["canonical_mel_note_count"], 3)
+        self.assertIs(row["source_exported_melody_exact"], False)
+        self.assertEqual(row["postjoin_new_acc_onset_count"], 2)
+        self.assertEqual(row["postjoin_crossing_acc_note_count"], 1)
+
+        metric_args = _build_parser().parse_args(
+            [
+                "--generated-dir",
+                str(generated.parent),
+                "--groundtruth-dir",
+                str(groundtruth.parent),
+                "--evaluation-duration-seconds",
+                "12.0",
+                "--duration-histogram-upper-bound-seconds",
+                "12.0",
+            ]
+        )
+        detail = evaluate_pair(generated, groundtruth, metric_args)
+        self.assertAlmostEqual(detail["harmonicity"]["consonant_ratio"], 0.6)
+        self.assertAlmostEqual(detail["harmonicity"]["unsupported_ratio"], 0.4)
 
     def test_empty_generated_accompaniment_is_a_valid_preparation_result(self) -> None:
         cohort, melody, _ = self._cohort()
@@ -311,6 +336,49 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
             if message.type == "track_name"
         ]
         self.assertIn("Melody", midi_tracks)
+
+    def test_crossing_only_sustain_is_not_a_valid_continuation_output(self) -> None:
+        cohort, melody, _ = self._cohort()
+        session = self.root / "crossing-only-session"
+        self._write_midi(
+            session / "combined.mid",
+            melody=[(60, 3.0, 5.0), (62, 7.0, 8.0), (64, 15.5, 17.0)],
+            accompaniment=[(48, 3.5, 5.0)],
+        )
+        realtime = self._write_realtime_manifest(
+            [
+                self._realtime_row(
+                    piece_id="piece-a",
+                    session=session,
+                    melody_hash=self._sha256(melody),
+                )
+            ],
+            name="crossing-only.csv",
+        )
+        output = self.root / "crossing-only-output"
+        result = prepare_matched_music_eval(
+            cohort_manifest=cohort,
+            realtime_manifest=realtime,
+            output_dir=output,
+            expected_piece_count=1,
+            expected_seeds=("0",),
+        )
+
+        row = result["trials"][0]
+        self.assertEqual(row["generated_acc_note_count"], 1)
+        self.assertEqual(row["postjoin_new_acc_onset_count"], 0)
+        self.assertEqual(row["postjoin_crossing_acc_note_count"], 1)
+        self.assertIs(row["valid_output"], False)
+        self.assertIsNone(row["valid_only_generated_midi"])
+        published = pretty_midi.PrettyMIDI(
+            str(output / row["all_trials_generated_midi"])
+        )
+        accompaniment = next(
+            track for track in published.instruments if track.name == "Accompaniment"
+        )
+        self.assertEqual(len(accompaniment.notes), 1)
+        self.assertAlmostEqual(accompaniment.notes[0].start, 0.0, places=5)
+        self.assertAlmostEqual(accompaniment.notes[0].end, 1.0, places=5)
 
     def test_empty_gt_accompaniment_is_rejected_by_cohort_contract(self) -> None:
         cohort, melody, _ = self._cohort(gt_accompaniment=[])
@@ -651,8 +719,11 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
                     for track in prepared.instruments
                     if track.name == "Melody"
                 )
-                self.assertAlmostEqual(melody_note.start, 1.0, places=5)
+                self.assertAlmostEqual(melody_note.start, 0.0, places=5)
                 audit_row = result["trials"][0]
+                self.assertEqual(audit_row["source_exported_mel_note_count"], 1)
+                self.assertEqual(audit_row["canonical_mel_note_count"], 3)
+                self.assertIs(audit_row["source_exported_melody_exact"], False)
                 self.assertEqual(
                     Path(audit_row["source_gt_midi"]), postjoin_gt.resolve()
                 )

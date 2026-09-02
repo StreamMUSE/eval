@@ -200,17 +200,23 @@ Each system has two explicit collections:
 
 - `all_trials/` retains every complete trial, including legal REST-only or
   empty-accompaniment results. `prepared_manifest.json` reports
-  `generated_acc_note_count`, `valid_output`, and the all-trial denominator for
-  Valid Output Rate.
+  `generated_acc_note_count`, the count of new post-join accompaniment onsets,
+  crossing-note count, `valid_output`, and the all-trial denominator for Valid
+  Output Rate.
 - `valid_only/` contains only basename-matched trials with at least one
-  generated accompaniment note. Existing music metrics run on this explicitly
-  conditional subset (`music_metrics_scope=conditional_on_valid_output`). Its
-  `generated/` and `groundtruth/` directories are created even when the subset
-  is empty, so a zero-valid-output system remains an explicit empty set.
+  new accompaniment onset in `[beat 8, beat 32)`. A sustain crossing beat 8 is
+  retained in `all_trials/` but does not make a continuation valid. Existing
+  music metrics run on this explicitly conditional subset
+  (`music_metrics_scope=conditional_on_valid_output`). Its `generated/` and
+  `groundtruth/` directories are created even when the subset is empty, so a
+  zero-valid-output system remains an explicit empty set.
 
-Generated MIDI keeps Melody and Accompaniment content. Metric-ready GT is
-accompaniment-only and its sole instrument is named `Piano`, matching the
-legacy evaluator contract; the full cohort GT remains referenced in the audit.
+Published generated MIDI combines the cohort canonical post-join Melody with
+the source system's generated Accompaniment. The audit retains the source
+exported Melody count and geometry hash and records whether that geometry
+matched canonical. Metric-ready GT is accompaniment-only and its sole
+instrument is named `Piano`, matching the legacy evaluator contract; the full
+cohort GT remains referenced in the audit.
 For offline rows, `source_gt_midi` and `source_gt_sha256` identify the supplied
 post-join GT file, while `cohort_full_gt_midi` and `cohort_full_gt_sha256`
 identify the independently verified cohort source; the two hashes are never
@@ -227,11 +233,29 @@ end time while ignoring velocity; a false value does not block publication.
 Metric-ready GT is always rebuilt from the cohort, never from offline
 round-trip MIDI.
 
+For formal matched metrics, evaluate every valid-only system with fixed 12 s
+onset and duration domains:
+
+```bash
+python evaluate_accompaniment_metrics.py \
+  --generated-dir results/matched_music/<system>/valid_only/generated \
+  --groundtruth-dir results/matched_music/<system>/valid_only/groundtruth \
+  --evaluation-duration-seconds 12.0 \
+  --duration-histogram-upper-bound-seconds 12.0 \
+  --output-json results/<system>/metrics.json
+```
+
+Omitting both fixed-domain options preserves the evaluator's legacy dynamic
+histogram behavior for nonformal uses.
+
 ### Summarize matched music metrics
 
 `summarize_matched_music_metrics.py` joins the preparation audit with one
 `evaluate_accompaniment_metrics.py` JSON per system, validates exact
-piece/seed/detail alignment, and reports formal matched confidence intervals:
+piece/seed/detail alignment, generated/GT MIDI SHA256 identity, and the formal
+fixed 12 s histogram configuration. It also fingerprints the complete
+metric-affecting `metric_config` and rejects any cross-system mismatch,
+including different bin counts, before reporting matched confidence intervals:
 
 ```bash
 PYTHONPATH=src python -m eval_toolkit.summarize_matched_music_metrics \

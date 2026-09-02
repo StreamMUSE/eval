@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import sys
 import tempfile
@@ -26,6 +27,10 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    @staticmethod
+    def _trial_hash(piece_id: str, seed: str, kind: str) -> str:
+        return hashlib.sha256(f"{kind}:{piece_id}:{seed}".encode()).hexdigest()
+
     def _write_audit(
         self,
         valid_by_system: dict[str, dict[tuple[str, str], bool]],
@@ -45,6 +50,12 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
                         "source_status": "complete",
                         "preparation_status": "prepared",
                         "valid_output": str(valid_output),
+                        "generated_sha256": self._trial_hash(
+                            piece_id, seed, "generated"
+                        ),
+                        "metric_gt_sha256": self._trial_hash(
+                            piece_id, seed, "metric-gt"
+                        ),
                     }
                 )
         rows.extend(extra_rows or [])
@@ -58,6 +69,8 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
                     "source_status",
                     "preparation_status",
                     "valid_output",
+                    "generated_sha256",
+                    "metric_gt_sha256",
                 ),
             )
             writer.writeheader()
@@ -72,12 +85,22 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
     ) -> dict[str, object]:
         return {
             "piece": f"piece-{piece_id}__seed-{seed}",
+            "generated_sha256": SummarizeMatchedMusicMetricsTest._trial_hash(
+                piece_id, seed, "generated"
+            ),
+            "metric_gt_sha256": SummarizeMatchedMusicMetricsTest._trial_hash(
+                piece_id, seed, "metric-gt"
+            ),
             "pitch_jsd": value,
             "onset_jsd": value + 0.1,
             "duration_jsd": value + 0.2,
             "harmonicity": {
                 "consonant_ratio": 0.8 - value / 10.0,
                 "unsupported_ratio": 0.1 + value / 20.0,
+            },
+            "histograms": {
+                "onset_edges": [12.0 * index / 64 for index in range(65)],
+                "duration_edges": [12.0 * index / 64 for index in range(65)],
             },
         }
 
@@ -95,7 +118,20 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
         path.write_text(
             json.dumps(
                 {
-                    "meta": {"pairs": len(details) if pairs is None else pairs},
+                    "meta": {
+                        "schema_version": 2,
+                        "pairs": len(details) if pairs is None else pairs,
+                        "metric_config": {
+                            "histogram_mode": "fixed_seconds",
+                            "evaluation_duration_seconds": 12.0,
+                            "onset_bins": 64,
+                            "onset_histogram_range_seconds": [0.0, 12.0],
+                            "onset_histogram_coordinate": "seconds",
+                            "duration_bins": 64,
+                            "duration_histogram_upper_bound_seconds": 12.0,
+                            "duration_histogram_range_seconds": [0.0, 12.0],
+                        },
+                    },
                     "summary": {
                         "accompaniment_vs_groundtruth": {
                             "pitch_jsd": {"count": count},
@@ -413,6 +449,73 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
             summarize_matched_music_metrics(
                 audit_path=audit,
                 metrics_paths={"A": metrics},
+                expected_piece_count=2,
+                expected_seeds=("0", "1"),
+                bootstrap_replicates=10,
+            )
+
+    def test_detail_hashes_and_formal_histogram_config_are_validated(self) -> None:
+        grid = self._grid()
+        audit = self._write_audit({"A": grid})
+
+        for field in ("generated_sha256", "metric_gt_sha256"):
+            with self.subTest(field=field):
+                details = self._valid_details(grid)
+                details[0][field] = "f" * 64
+                metrics = self._write_metrics(
+                    self.root / f"bad-{field}.json", details
+                )
+                with self.assertRaisesRegex(
+                    MusicSummaryValidationError, "does not match audit line"
+                ):
+                    summarize_matched_music_metrics(
+                        audit_path=audit,
+                        metrics_paths={"A": metrics},
+                        expected_piece_count=2,
+                        expected_seeds=("0", "1"),
+                        bootstrap_replicates=10,
+                    )
+
+        metrics = self._write_metrics(
+            self.root / "dynamic-config.json", self._valid_details(grid)
+        )
+        payload = json.loads(metrics.read_text(encoding="utf-8"))
+        payload["meta"]["metric_config"]["histogram_mode"] = "legacy_dynamic"
+        metrics.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(
+            MusicSummaryValidationError, "histogram_mode must be fixed_seconds"
+        ):
+            summarize_matched_music_metrics(
+                audit_path=audit,
+                metrics_paths={"A": metrics},
+                expected_piece_count=2,
+                expected_seeds=("0", "1"),
+                bootstrap_replicates=10,
+            )
+
+    def test_cross_system_histogram_config_mismatch_is_rejected(self) -> None:
+        grid = self._grid()
+        audit = self._write_audit({"A": grid, "B": grid})
+        metrics_a = self._write_metrics(
+            self.root / "matched-a.json", self._valid_details(grid)
+        )
+        metrics_b = self._write_metrics(
+            self.root / "matched-b-128bins.json", self._valid_details(grid)
+        )
+        payload = json.loads(metrics_b.read_text(encoding="utf-8"))
+        payload["meta"]["metric_config"]["onset_bins"] = 128
+        for detail in payload["details"]:
+            detail["histograms"]["onset_edges"] = [
+                12.0 * index / 128 for index in range(129)
+            ]
+        metrics_b.write_text(json.dumps(payload), encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            MusicSummaryValidationError, "matched metric_config mismatch"
+        ):
+            summarize_matched_music_metrics(
+                audit_path=audit,
+                metrics_paths={"A": metrics_a, "B": metrics_b},
                 expected_piece_count=2,
                 expected_seeds=("0", "1"),
                 bootstrap_replicates=10,

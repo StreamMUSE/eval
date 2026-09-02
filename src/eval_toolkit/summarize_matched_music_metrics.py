@@ -19,6 +19,8 @@ EXPECTED_PIECE_COUNT = 40
 EXPECTED_SEEDS = ("0", "1", "2")
 DEFAULT_BOOTSTRAP_REPLICATES = 10_000
 DEFAULT_BOOTSTRAP_SEED = 0
+FORMAL_EVALUATION_DURATION_SECONDS = 12.0
+FORMAL_DURATION_HISTOGRAM_UPPER_BOUND_SECONDS = 12.0
 DETAIL_METRICS = {
     "pitch_jsd": ("pitch_jsd",),
     "onset_jsd": ("onset_jsd",),
@@ -58,6 +60,8 @@ class AuditTrial:
     seed: str
     system_id: str
     valid_output: bool
+    generated_sha256: str
+    metric_gt_sha256: str
     line_number: int
 
 
@@ -67,6 +71,7 @@ class SystemInput:
     details: dict[tuple[str, str], dict[str, float]]
     fmd: float | None
     metrics_path: Path
+    metric_config_fingerprint: str
 
 
 def _finite_number(value: Any, context: str) -> float:
@@ -93,6 +98,21 @@ def _strict_bool(value: str, context: str) -> bool:
     raise MusicSummaryValidationError(
         f"{context} must be exactly true or false, found {value!r}"
     )
+
+
+def _strict_sha256(value: Any, context: str) -> str:
+    if not isinstance(value, str):
+        raise MusicSummaryValidationError(
+            f"{context} must be 64 lowercase hexadecimal characters"
+        )
+    normalized = value.strip()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise MusicSummaryValidationError(
+            f"{context} must be 64 lowercase hexadecimal characters"
+        )
+    return normalized
 
 
 def _nested_optional(root: Any, path: Sequence[str]) -> Any:
@@ -175,6 +195,8 @@ def load_matched_audit(
         "source_status",
         "preparation_status",
         "valid_output",
+        "generated_sha256",
+        "metric_gt_sha256",
     }
     selected = set(system_ids)
     rows_by_system: dict[str, list[AuditTrial]] = {
@@ -231,6 +253,14 @@ def load_matched_audit(
                             str(row.get("valid_output") or ""),
                             f"audit line {line_number} valid_output",
                         ),
+                        generated_sha256=_strict_sha256(
+                            row.get("generated_sha256"),
+                            f"audit line {line_number} generated_sha256",
+                        ),
+                        metric_gt_sha256=_strict_sha256(
+                            row.get("metric_gt_sha256"),
+                            f"audit line {line_number} metric_gt_sha256",
+                        ),
                         line_number=line_number,
                     )
                 )
@@ -284,6 +314,154 @@ def load_matched_audit(
     }, reference_pieces
 
 
+def _validate_formal_range(
+    value: Any,
+    *,
+    expected_upper: float,
+    context: str,
+) -> None:
+    if not isinstance(value, list) or len(value) != 2:
+        raise MusicSummaryValidationError(
+            f"{context} must be [0.0, {expected_upper}]"
+        )
+    lower = _finite_number(value[0], f"{context}[0]")
+    upper = _finite_number(value[1], f"{context}[1]")
+    if not math.isclose(lower, 0.0, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(
+        upper, expected_upper, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise MusicSummaryValidationError(
+            f"{context} must be [0.0, {expected_upper}]"
+        )
+
+
+def _validate_formal_metric_config(
+    meta: Mapping[str, Any], path: Path
+) -> tuple[int, int, str]:
+    schema_version = _strict_integer(
+        meta.get("schema_version"), f"{path}: meta.schema_version"
+    )
+    if schema_version < 2:
+        raise MusicSummaryValidationError(
+            f"{path}: meta.schema_version must be at least 2"
+        )
+    config = meta.get("metric_config")
+    if not isinstance(config, Mapping):
+        raise MusicSummaryValidationError(
+            f"{path}: meta.metric_config is required for formal metrics"
+        )
+    if config.get("histogram_mode") != "fixed_seconds":
+        raise MusicSummaryValidationError(
+            f"{path}: formal metric histogram_mode must be fixed_seconds"
+        )
+    evaluation_duration = _finite_number(
+        config.get("evaluation_duration_seconds"),
+        f"{path}: metric_config.evaluation_duration_seconds",
+    )
+    if not math.isclose(
+        evaluation_duration,
+        FORMAL_EVALUATION_DURATION_SECONDS,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise MusicSummaryValidationError(
+            f"{path}: formal evaluation duration must be "
+            f"{FORMAL_EVALUATION_DURATION_SECONDS}s"
+        )
+    duration_upper = _finite_number(
+        config.get("duration_histogram_upper_bound_seconds"),
+        f"{path}: metric_config.duration_histogram_upper_bound_seconds",
+    )
+    if not math.isclose(
+        duration_upper,
+        FORMAL_DURATION_HISTOGRAM_UPPER_BOUND_SECONDS,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise MusicSummaryValidationError(
+            f"{path}: formal duration histogram upper bound must be "
+            f"{FORMAL_DURATION_HISTOGRAM_UPPER_BOUND_SECONDS}s"
+        )
+    if config.get("onset_histogram_coordinate") != "seconds":
+        raise MusicSummaryValidationError(
+            f"{path}: formal onset histogram coordinate must be seconds"
+        )
+    _validate_formal_range(
+        config.get("onset_histogram_range_seconds"),
+        expected_upper=FORMAL_EVALUATION_DURATION_SECONDS,
+        context=f"{path}: metric_config.onset_histogram_range_seconds",
+    )
+    _validate_formal_range(
+        config.get("duration_histogram_range_seconds"),
+        expected_upper=FORMAL_DURATION_HISTOGRAM_UPPER_BOUND_SECONDS,
+        context=f"{path}: metric_config.duration_histogram_range_seconds",
+    )
+    onset_bins = _strict_integer(
+        config.get("onset_bins"), f"{path}: metric_config.onset_bins"
+    )
+    duration_bins = _strict_integer(
+        config.get("duration_bins"), f"{path}: metric_config.duration_bins"
+    )
+    if onset_bins <= 0 or duration_bins <= 0:
+        raise MusicSummaryValidationError(
+            f"{path}: formal histogram bin counts must be positive"
+        )
+    try:
+        canonical_config = json.dumps(
+            config,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise MusicSummaryValidationError(
+            f"{path}: metric_config is not canonically serializable: {exc}"
+        ) from exc
+    fingerprint = hashlib.sha256(canonical_config).hexdigest()
+    return onset_bins, duration_bins, fingerprint
+
+
+def _validate_detail_edges(
+    detail: Mapping[str, Any],
+    *,
+    onset_bins: int,
+    duration_bins: int,
+    context: str,
+) -> None:
+    histograms = detail.get("histograms")
+    if not isinstance(histograms, Mapping):
+        raise MusicSummaryValidationError(f"{context}.histograms is required")
+    for field, count, upper in (
+        (
+            "onset_edges",
+            onset_bins,
+            FORMAL_EVALUATION_DURATION_SECONDS,
+        ),
+        (
+            "duration_edges",
+            duration_bins,
+            FORMAL_DURATION_HISTOGRAM_UPPER_BOUND_SECONDS,
+        ),
+    ):
+        raw_edges = histograms.get(field)
+        if not isinstance(raw_edges, list) or len(raw_edges) != count + 1:
+            raise MusicSummaryValidationError(
+                f"{context}.histograms.{field} must contain {count + 1} edges"
+            )
+        edges = np.asarray(
+            [
+                _finite_number(value, f"{context}.histograms.{field}")
+                for value in raw_edges
+            ],
+            dtype=np.float64,
+        )
+        expected = np.linspace(0.0, upper, count + 1)
+        if not np.allclose(edges, expected, rtol=0.0, atol=1e-12):
+            raise MusicSummaryValidationError(
+                f"{context}.histograms.{field} does not match fixed [0, {upper}] bins"
+            )
+
+
 def _load_system_metrics(
     path: Path,
     trials: Sequence[AuditTrial],
@@ -297,6 +475,9 @@ def _load_system_metrics(
     if not isinstance(meta, Mapping) or "pairs" not in meta:
         raise MusicSummaryValidationError(f"metrics meta.pairs is required: {path}")
     pairs = _strict_integer(meta["pairs"], f"{path}: meta.pairs")
+    onset_bins, duration_bins, metric_config_fingerprint = (
+        _validate_formal_metric_config(meta, path)
+    )
     details_raw = data.get("details")
     if not isinstance(details_raw, list):
         raise MusicSummaryValidationError(f"metrics details must be a list: {path}")
@@ -336,6 +517,29 @@ def _load_system_metrics(
             raise MusicSummaryValidationError(
                 f"unexpected metrics detail piece for {system_id!r}: {piece_name!r}"
             )
+        trial = valid_trials[trial_key]
+        generated_sha256 = _strict_sha256(
+            detail.get("generated_sha256"), f"{context}.generated_sha256"
+        )
+        metric_gt_sha256 = _strict_sha256(
+            detail.get("metric_gt_sha256"), f"{context}.metric_gt_sha256"
+        )
+        if generated_sha256 != trial.generated_sha256:
+            raise MusicSummaryValidationError(
+                f"{context}.generated_sha256 does not match audit line "
+                f"{trial.line_number}"
+            )
+        if metric_gt_sha256 != trial.metric_gt_sha256:
+            raise MusicSummaryValidationError(
+                f"{context}.metric_gt_sha256 does not match audit line "
+                f"{trial.line_number}"
+            )
+        _validate_detail_edges(
+            detail,
+            onset_bins=onset_bins,
+            duration_bins=duration_bins,
+            context=context,
+        )
         values: dict[str, float] = {}
         for metric, metric_path in DETAIL_METRICS.items():
             values[metric] = _finite_number(
@@ -385,6 +589,7 @@ def _load_system_metrics(
         details=detail_values,
         fmd=fmd,
         metrics_path=path,
+        metric_config_fingerprint=metric_config_fingerprint,
     )
 
 
@@ -444,6 +649,18 @@ def summarize_matched_music_metrics(
         )
         for system_id in system_ids
     }
+    reference_system_id = system_ids[0]
+    matched_metric_config_fingerprint = system_inputs[
+        reference_system_id
+    ].metric_config_fingerprint
+    for system_id in system_ids[1:]:
+        system_fingerprint = system_inputs[system_id].metric_config_fingerprint
+        if system_fingerprint != matched_metric_config_fingerprint:
+            raise MusicSummaryValidationError(
+                "matched metric_config mismatch between systems "
+                f"{reference_system_id!r} and {system_id!r}: "
+                f"{matched_metric_config_fingerprint} != {system_fingerprint}"
+            )
 
     rng = np.random.default_rng(bootstrap_seed)
     draws = rng.integers(
@@ -536,6 +753,9 @@ def summarize_matched_music_metrics(
         )
         system_results[system_id] = {
             "metrics_path": str(system_input.metrics_path),
+            "metric_config_fingerprint": (
+                system_input.metric_config_fingerprint
+            ),
             "piece_count": len(pieces),
             "seed_count": len(expected_seeds),
             "trial_count": all_trial_count,
@@ -544,8 +764,9 @@ def summarize_matched_music_metrics(
         }
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "audit_path": str(audit_path.resolve()),
+        "matched_metric_config_fingerprint": matched_metric_config_fingerprint,
         "expected_grid": {
             "piece_count": expected_piece_count,
             "seeds": list(expected_seeds),

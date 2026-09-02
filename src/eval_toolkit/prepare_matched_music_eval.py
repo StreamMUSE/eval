@@ -37,6 +37,9 @@ DEFAULT_EXPECTED_PIECE_COUNT = 40
 DEFAULT_EXPECTED_SEEDS = ("0", "1", "2")
 RUN_STATUSES = {"complete", "failed", "missing"}
 HASH_KIND = "melody_midi_file_sha256"
+VALID_OUTPUT_DEFINITION = (
+    "at least one accompaniment note onset inside [beat 8, beat 32)"
+)
 
 STATUS_ALIASES = ("run_status", "status")
 HASH_ALIASES = ("melody_input_sha256", "hash")
@@ -77,6 +80,11 @@ AUDIT_FIELDS = (
     "cohort_full_gt_sha256",
     "cohort_postjoin_melody_note_count",
     "cohort_postjoin_melody_sha256",
+    "canonical_mel_note_count",
+    "canonical_melody_geometry_sha256",
+    "source_exported_mel_note_count",
+    "source_exported_melody_geometry_sha256",
+    "source_exported_melody_exact",
     "cohort_source_npz",
     "cohort_source_npz_sha256",
     "trial_source_npz_sha256",
@@ -88,7 +96,10 @@ AUDIT_FIELDS = (
     "source_gt_mel_note_count",
     "source_gt_acc_note_count",
     "metric_gt_acc_note_count",
+    "postjoin_new_acc_onset_count",
+    "postjoin_crossing_acc_note_count",
     "valid_output",
+    "valid_output_definition",
     "window_start_beat",
     "window_end_beat_exclusive",
     "window_start_s",
@@ -157,6 +168,8 @@ class WindowMidi:
     accompaniment: tuple[NoteValue, ...]
     melody_program: int = 0
     accompaniment_program: int = 0
+    accompaniment_new_onset_count: int = 0
+    accompaniment_crossing_note_count: int = 0
 
 
 def file_sha256(path: Path) -> str:
@@ -599,8 +612,10 @@ def _extract_window(
     end_s = WINDOW_DURATION_S if already_postjoin else WINDOW_END_S
     shift_s = 0.0 if already_postjoin else WINDOW_START_S
 
-    def collect(role: str) -> tuple[NoteValue, ...]:
+    def collect(role: str) -> tuple[tuple[NoteValue, ...], int, int]:
         notes: list[NoteValue] = []
+        new_onset_count = 0
+        crossing_note_count = 0
         for instrument in role_instruments[role]:
             for note in instrument.notes:
                 values = (float(note.start), float(note.end))
@@ -621,6 +636,11 @@ def _extract_window(
                     continue
                 if note.start >= end_s - TIME_EPSILON_S:
                     continue
+                if role == "accompaniment":
+                    if note.start < start_s - TIME_EPSILON_S:
+                        crossing_note_count += 1
+                    else:
+                        new_onset_count += 1
                 clipped_start = max(note.start, start_s) - shift_s
                 clipped_end = min(note.end, end_s) - shift_s
                 clipped_start = max(0.0, clipped_start)
@@ -635,10 +655,14 @@ def _extract_window(
                         end=clipped_end,
                     )
                 )
-        return tuple(sorted(notes, key=lambda n: (n.start, n.pitch, n.end, n.velocity)))
+        return (
+            tuple(sorted(notes, key=lambda n: (n.start, n.pitch, n.end, n.velocity))),
+            new_onset_count,
+            crossing_note_count,
+        )
 
-    melody = collect("melody")
-    accompaniment = collect("accompaniment")
+    melody, _, _ = collect("melody")
+    accompaniment, new_onset_count, crossing_note_count = collect("accompaniment")
     if not melody:
         raise PreparationError(f"postjoin Melody track is empty: {path}")
     if require_accompaniment_notes and not accompaniment:
@@ -655,6 +679,8 @@ def _extract_window(
         accompaniment=accompaniment,
         melody_program=melody_program,
         accompaniment_program=accompaniment_program,
+        accompaniment_new_onset_count=new_onset_count,
+        accompaniment_crossing_note_count=crossing_note_count,
     )
 
 
@@ -710,6 +736,15 @@ def _canonical_note_geometry(
 def _canonical_note_sha256(notes: Sequence[NoteValue]) -> str:
     payload = json.dumps(
         _canonical_note_values(notes),
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_note_geometry_sha256(notes: Sequence[NoteValue]) -> str:
+    payload = json.dumps(
+        _canonical_note_geometry(notes),
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("utf-8")
@@ -961,6 +996,13 @@ def _empty_audit(trial: Trial, cohort_piece: CohortPiece) -> dict[str, Any]:
         "cohort_full_gt_sha256": cohort_piece.gt_midi_sha256,
         "cohort_postjoin_melody_note_count": len(cohort_piece.postjoin_gt.melody),
         "cohort_postjoin_melody_sha256": cohort_piece.postjoin_melody_sha256,
+        "canonical_mel_note_count": len(cohort_piece.postjoin_gt.melody),
+        "canonical_melody_geometry_sha256": _canonical_note_geometry_sha256(
+            cohort_piece.postjoin_gt.melody
+        ),
+        "source_exported_mel_note_count": None,
+        "source_exported_melody_geometry_sha256": None,
+        "source_exported_melody_exact": None,
         "cohort_source_npz": (
             str(cohort_piece.source_npz)
             if cohort_piece.source_npz is not None
@@ -976,7 +1018,10 @@ def _empty_audit(trial: Trial, cohort_piece: CohortPiece) -> dict[str, Any]:
         "source_gt_mel_note_count": None,
         "source_gt_acc_note_count": None,
         "metric_gt_acc_note_count": None,
+        "postjoin_new_acc_onset_count": None,
+        "postjoin_crossing_acc_note_count": None,
         "valid_output": None,
+        "valid_output_definition": VALID_OUTPUT_DEFINITION,
         "window_start_beat": WINDOW_START_BEAT,
         "window_end_beat_exclusive": WINDOW_END_BEAT,
         "window_start_s": WINDOW_START_S,
@@ -1118,9 +1163,25 @@ def prepare_matched_music_eval(
                     )
                 source_paths.add(source_key)
 
+                source_exported_melody_exact = _canonical_note_geometry(
+                    generated.melody
+                ) == _canonical_note_geometry(cohort_gt.melody)
+                published_generated = WindowMidi(
+                    melody=cohort_gt.melody,
+                    accompaniment=generated.accompaniment,
+                    melody_program=cohort_gt.melody_program,
+                    accompaniment_program=generated.accompaniment_program,
+                    accompaniment_new_onset_count=(
+                        generated.accompaniment_new_onset_count
+                    ),
+                    accompaniment_crossing_note_count=(
+                        generated.accompaniment_crossing_note_count
+                    ),
+                )
+
                 generated_target = staging / audit["all_trials_generated_midi"]
                 gt_target = staging / audit["all_trials_metric_gt_midi"]
-                write_window_midi(generated, generated_target)
+                write_window_midi(published_generated, generated_target)
                 write_metric_groundtruth(cohort_gt, gt_target)
 
                 generated_check = _extract_window(
@@ -1130,7 +1191,9 @@ def prepare_matched_music_eval(
                     require_accompaniment_notes=False,
                 )
                 gt_check = _read_metric_groundtruth(gt_target)
-                if _canonical_notes(generated_check) != _canonical_notes(generated):
+                if _canonical_notes(generated_check) != _canonical_notes(
+                    published_generated
+                ):
                     raise PreparationError(
                         "written generated MIDI failed round-trip check"
                     )
@@ -1141,7 +1204,7 @@ def prepare_matched_music_eval(
                         "written groundtruth MIDI failed round-trip check"
                     )
 
-                valid_output = bool(generated.accompaniment)
+                valid_output = generated.accompaniment_new_onset_count > 0
                 if valid_output:
                     basename = generated_target.name
                     system_dir = _slug(trial.system_id)
@@ -1170,11 +1233,24 @@ def prepare_matched_music_eval(
                         ),
                         "generated_sha256": file_sha256(generated_target),
                         "metric_gt_sha256": file_sha256(gt_target),
-                        "generated_mel_note_count": len(generated.melody),
+                        "generated_mel_note_count": len(published_generated.melody),
                         "generated_acc_note_count": len(generated.accompaniment),
+                        "source_exported_mel_note_count": len(generated.melody),
+                        "source_exported_melody_geometry_sha256": (
+                            _canonical_note_geometry_sha256(generated.melody)
+                        ),
+                        "source_exported_melody_exact": (
+                            source_exported_melody_exact
+                        ),
                         "source_gt_mel_note_count": len(cohort_gt.melody),
                         "source_gt_acc_note_count": len(cohort_gt.accompaniment),
                         "metric_gt_acc_note_count": len(gt_check),
+                        "postjoin_new_acc_onset_count": (
+                            generated.accompaniment_new_onset_count
+                        ),
+                        "postjoin_crossing_acc_note_count": (
+                            generated.accompaniment_crossing_note_count
+                        ),
                         "valid_output": valid_output,
                         "preparation_status": "prepared",
                         "reason": "",
@@ -1234,14 +1310,20 @@ def prepare_matched_music_eval(
                     valid_count / planned_count if planned_count else None
                 ),
                 "valid_output_denominator": "all planned matched trials",
+                "valid_output_definition": VALID_OUTPUT_DEFINITION,
                 "music_metrics_scope": "conditional_on_valid_output",
             }
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "preparation_status": status,
             "tool_scope": "music_quality_input_preparation",
             "produces_system_metrics": False,
             "melody_hash_kind": HASH_KIND,
+            "source_exported_melody_exact_definition": (
+                "source exported post-join Melody pitch/onset/duration geometry "
+                "equals the cohort canonical Melody geometry; velocity is ignored"
+            ),
+            "valid_output_definition": VALID_OUTPUT_DEFINITION,
             "cohort_manifest": str(cohort_manifest.resolve()),
             "window": {
                 "bpm": BPM,

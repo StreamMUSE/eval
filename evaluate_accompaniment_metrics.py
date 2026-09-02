@@ -14,24 +14,26 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import importlib.metadata
 import json
 import logging
 import math
+import os
+import platform
 import random
 import re
+import shutil
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
-import os
-import shutil
-import tempfile
 from typing import Iterable, List, Optional, Sequence, Tuple
 
+import mir_eval.chord
 import numpy as np
 import pretty_midi
-import mir_eval.chord
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +41,7 @@ LOGGER = logging.getLogger(__name__)
 POLYDIS_CACHE: dict[Path, dict] = {}
 
 _ACCOMPANIMENT_TRACK_NAMES = {"piano"}
+METRICS_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -46,6 +49,7 @@ class DistributionConfig:
     pitch_bins: Sequence[int]
     onset_bins: np.ndarray
     duration_bins: np.ndarray
+    onset_values_in_seconds: bool = False
 
 
 @dataclass
@@ -198,13 +202,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--onset-bins",
         type=int,
         default=64,
-        help="Number of uniform bins for the normalized onset histogram.",
+        help="Number of uniform bins for the onset histogram.",
     )
     parser.add_argument(
         "--duration-bins",
         type=int,
         default=64,
-        help="Number of uniform bins for the duration histogram (after clipping to the specified quantile).",
+        help=(
+            "Number of uniform duration bins. Their upper bound is fixed when "
+            "explicitly supplied, otherwise inferred from the pair."
+        ),
     )
     parser.add_argument(
         "--duration-clip-quantile",
@@ -213,12 +220,145 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Clip durations above this quantile before histogramming to reduce outlier influence (range 0-1].",
     )
     parser.add_argument(
+        "--evaluation-duration-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Use absolute onset bins over [0, D] seconds instead of pair-relative "
+            "normalization. Omit to preserve the legacy dynamic behavior."
+        ),
+    )
+    parser.add_argument(
+        "--duration-histogram-upper-bound-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Use fixed duration bins over [0, D] seconds, clipping longer notes "
+            "into the final bin. Omit to preserve pair-dependent quantile bins."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         help="Logging verbosity.",
     )
     return parser
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _json_safe(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value.resolve())
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return value
+
+
+def _metric_config(args: argparse.Namespace) -> dict[str, object]:
+    evaluation_duration = getattr(args, "evaluation_duration_seconds", None)
+    duration_upper_bound = getattr(
+        args, "duration_histogram_upper_bound_seconds", None
+    )
+    if evaluation_duration is not None and duration_upper_bound is not None:
+        histogram_mode = "fixed_seconds"
+    elif evaluation_duration is None and duration_upper_bound is None:
+        histogram_mode = "legacy_dynamic"
+    else:
+        histogram_mode = "mixed_explicit"
+    return {
+        "schema_version": 1,
+        "histogram_mode": histogram_mode,
+        "evaluation_duration_seconds": evaluation_duration,
+        "onset_bins": args.onset_bins,
+        "onset_histogram_range_seconds": (
+            [0.0, evaluation_duration]
+            if evaluation_duration is not None
+            else None
+        ),
+        "onset_histogram_coordinate": (
+            "seconds"
+            if evaluation_duration is not None
+            else "pair_max_end_normalized"
+        ),
+        "duration_bins": args.duration_bins,
+        "duration_histogram_upper_bound_seconds": duration_upper_bound,
+        "duration_histogram_range_seconds": (
+            [0.0, duration_upper_bound]
+            if duration_upper_bound is not None
+            else None
+        ),
+        "duration_clip_quantile": args.duration_clip_quantile,
+        "pitch_bins": list(range(129)),
+        "melody_track_names": list(args.melody_track_names),
+        "melody_programs": list(args.melody_programs),
+        "melody_track_indices": list(args.melody_track_indices),
+        "keep_melody": args.keep_melody,
+        "include_drums": args.include_drums,
+        "consonant_intervals": list(args.consonant_intervals),
+        "frechet_music_distance": args.frechet_music_distance,
+        "frechet_model": args.frechet_model,
+        "frechet_estimator": args.frechet_estimator,
+    }
+
+
+def _package_versions() -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for distribution in (
+        "numpy",
+        "pretty-midi",
+        "mir-eval",
+        "mido",
+        "frechet-music-distance",
+    ):
+        try:
+            versions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            versions[distribution] = None
+    return versions
+
+
+def _reproducibility_metadata() -> dict[str, object]:
+    script_path = Path(__file__).resolve()
+    return {
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "platform": platform.platform(),
+        "packages": _package_versions(),
+        "code": {
+            "evaluator_path": str(script_path),
+            "evaluator_sha256": _file_sha256(script_path),
+        },
+    }
+
+
+def _validate_metric_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    if args.onset_bins <= 0:
+        parser.error("--onset-bins must be positive")
+    if args.duration_bins <= 0:
+        parser.error("--duration-bins must be positive")
+    if not 0.0 < args.duration_clip_quantile <= 1.0:
+        parser.error("--duration-clip-quantile must be in (0, 1]")
+    for option, value in (
+        ("--evaluation-duration-seconds", args.evaluation_duration_seconds),
+        (
+            "--duration-histogram-upper-bound-seconds",
+            args.duration_histogram_upper_bound_seconds,
+        ),
+    ):
+        if value is not None and (not math.isfinite(value) or value <= 0.0):
+            parser.error(f"{option} must be a finite positive number")
 
 
 def _collect_accompaniment_notes(
@@ -320,7 +460,17 @@ def _compute_onset_histogram(
     notes: Sequence[pretty_midi.Note],
     piece_length: float,
     bin_edges: np.ndarray,
+    *,
+    values_in_seconds: bool = False,
 ) -> np.ndarray:
+    if values_in_seconds:
+        lower = float(bin_edges[0])
+        upper = float(bin_edges[-1])
+        starts = [
+            note.start for note in notes if lower <= note.start < upper
+        ]
+        hist, _ = np.histogram(starts, bins=bin_edges, density=False)
+        return hist.astype(np.float64)
     if piece_length <= 0:
         return np.zeros(bin_edges.size - 1, dtype=np.float64)
     starts = [max(0.0, min(1.0, note.start / piece_length)) for note in notes]
@@ -346,6 +496,8 @@ def _determine_distribution_bins(
     onset_bins: int,
     duration_bins: int,
     duration_clip_quantile: float,
+    evaluation_duration_seconds: float | None = None,
+    duration_histogram_upper_bound_seconds: float | None = None,
 ) -> tuple[DistributionConfig, float]:
     all_notes = list(generated_notes) + list(ground_truth_notes)
     if all_notes:
@@ -353,10 +505,21 @@ def _determine_distribution_bins(
     else:
         piece_length = 0.0
 
-    onset_edges = np.linspace(0.0, 1.0, onset_bins + 1)
+    onset_values_in_seconds = evaluation_duration_seconds is not None
+    onset_upper_bound = (
+        evaluation_duration_seconds
+        if evaluation_duration_seconds is not None
+        else 1.0
+    )
+    onset_edges = np.linspace(0.0, onset_upper_bound, onset_bins + 1)
 
-    durations = np.array([max(0.0, note.end - note.start) for note in all_notes], dtype=np.float64)
-    if durations.size == 0:
+    durations = np.array(
+        [max(0.0, note.end - note.start) for note in all_notes],
+        dtype=np.float64,
+    )
+    if duration_histogram_upper_bound_seconds is not None:
+        max_duration = duration_histogram_upper_bound_seconds
+    elif durations.size == 0:
         max_duration = 0.0
     else:
         quantile = np.clip(duration_clip_quantile, 0.0, 1.0)
@@ -371,6 +534,7 @@ def _determine_distribution_bins(
             pitch_bins=list(range(129)),
             onset_bins=onset_edges,
             duration_bins=duration_edges,
+            onset_values_in_seconds=onset_values_in_seconds,
         ),
         piece_length,
     )
@@ -607,7 +771,7 @@ def _prepare_polydis_model(polydis_root: Path):
         sys.path.insert(0, str(polydis_root))
 
     try:
-        import torch  # pylint: disable=import-outside-toplevel
+        import torch  # noqa: F401  # pylint: disable=import-outside-toplevel
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise RuntimeError("PyTorch is required for PolyDis metrics") from exc
 
@@ -1493,12 +1657,24 @@ def evaluate_pair(
         args.onset_bins,
         args.duration_bins,
         args.duration_clip_quantile,
+        getattr(args, "evaluation_duration_seconds", None),
+        getattr(args, "duration_histogram_upper_bound_seconds", None),
     )
 
     pitch_generated = _compute_pitch_histogram(generated_notes)
     pitch_ground_truth = _compute_pitch_histogram(ground_truth_notes)
-    onset_generated = _compute_onset_histogram(generated_notes, piece_length, config.onset_bins)
-    onset_ground_truth = _compute_onset_histogram(ground_truth_notes, piece_length, config.onset_bins)
+    onset_generated = _compute_onset_histogram(
+        generated_notes,
+        piece_length,
+        config.onset_bins,
+        values_in_seconds=config.onset_values_in_seconds,
+    )
+    onset_ground_truth = _compute_onset_histogram(
+        ground_truth_notes,
+        piece_length,
+        config.onset_bins,
+        values_in_seconds=config.onset_values_in_seconds,
+    )
     duration_generated = _compute_duration_histogram(generated_notes, config.duration_bins)
     duration_ground_truth = _compute_duration_histogram(ground_truth_notes, config.duration_bins)
     harmonicity = _compute_harmonic_consonance(melody_notes, generated_notes, args.consonant_intervals)
@@ -1590,6 +1766,8 @@ def evaluate_pair(
         "piece": generated_path.stem,
         "generated_path": str(generated_path),
         "groundtruth_path": str(groundtruth_path),
+        "generated_sha256": _file_sha256(generated_path),
+        "metric_gt_sha256": _file_sha256(groundtruth_path),
         "prompt_path": str(prompt_path) if prompt_path is not None else None,
         "note_counts": {
             "generated": len(generated_notes),
@@ -1620,6 +1798,7 @@ def evaluate_pair(
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+    _validate_metric_args(parser, args)
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s | %(message)s")
 
@@ -1821,7 +2000,13 @@ def main() -> None:
     if args.output_json:
         payload = {
             "meta": {
+                "schema_version": METRICS_SCHEMA_VERSION,
                 "pairs": len(results),
+                "metric_config": _metric_config(args),
+                "cli_config": {
+                    key: _json_safe(value) for key, value in vars(args).items()
+                },
+                "reproducibility": _reproducibility_metadata(),
             },
             "summary": {
                 "accompaniment_vs_groundtruth": accompaniment_vs_gt_summary,
