@@ -72,6 +72,9 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
     ) -> tuple[Path, Path, Path]:
         melody = self.root / piece_id / "melody_120bpm.mid"
         gt = self.root / piece_id / "gt_120bpm.mid"
+        source_npz = self.root / piece_id / "source.npz"
+        source_npz.parent.mkdir(parents=True, exist_ok=True)
+        source_npz.write_bytes(f"canonical-npz:{piece_id}".encode())
         self._write_midi(
             melody,
             melody=[(60, 3.0, 5.0), (62, 7.0, 8.0), (64, 15.5, 17.0)],
@@ -95,8 +98,10 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
                             "piece_id": piece_id,
                             "melody_midi": str(melody.relative_to(self.root)),
                             "gt_midi": str(gt.relative_to(self.root)),
+                            "source_npz": str(source_npz.relative_to(self.root)),
                             "melody_midi_sha256": declared_hash or self._sha256(melody),
                             "gt_midi_sha256": declared_gt_hash or self._sha256(gt),
+                            "source_npz_sha256": self._sha256(source_npz),
                         }
                     ]
                 }
@@ -104,6 +109,11 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
             encoding="utf-8",
         )
         return manifest, melody, gt
+
+    @staticmethod
+    def _cohort_source_npz_sha256(cohort_manifest: Path) -> str:
+        data = json.loads(cohort_manifest.read_text(encoding="utf-8"))
+        return data["samples"][0]["source_npz_sha256"]
 
     @staticmethod
     def _write_postjoin_gt(source: Path, target: Path) -> None:
@@ -520,6 +530,24 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
                 expected_seeds=("0",),
             )
 
+    def test_cohort_requires_a_valid_source_npz_identity_hash(self) -> None:
+        cases = (
+            ("missing", None, "source_npz_sha256.*missing"),
+            ("malformed", "abc", "64 lowercase hex digits"),
+            ("mismatch", "0" * 64, "source NPZ file hash mismatch"),
+        )
+        for case, replacement, message in cases:
+            with self.subTest(case=case):
+                cohort, _, _ = self._cohort(piece_id=f"source-hash-{case}")
+                data = json.loads(cohort.read_text(encoding="utf-8"))
+                if replacement is None:
+                    data["samples"][0].pop("source_npz_sha256")
+                else:
+                    data["samples"][0]["source_npz_sha256"] = replacement
+                cohort.write_text(json.dumps(data), encoding="utf-8")
+                with self.assertRaisesRegex(PreparationError, message):
+                    load_cohort_manifest(cohort)
+
     def test_cohort_melody_content_contract_rejects_self_hashed_bad_files(
         self,
     ) -> None:
@@ -595,6 +623,7 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
                     "system_id": f"beat-offline-{extension}",
                     "postjoin_generated_midi": str(generated),
                     "postjoin_gt_midi": str(postjoin_gt),
+                    "source_npz_sha256": self._cohort_source_npz_sha256(cohort),
                     "run_status": "complete",
                     "failure_reason": "",
                 }
@@ -637,6 +666,15 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
                     audit_row["cohort_full_gt_sha256"], self._sha256(gt_full)
                 )
                 self.assertEqual(
+                    audit_row["trial_source_npz_sha256"],
+                    self._cohort_source_npz_sha256(cohort),
+                )
+                self.assertEqual(
+                    audit_row["cohort_source_npz_sha256"],
+                    self._cohort_source_npz_sha256(cohort),
+                )
+                self.assertIs(audit_row["offline_gt_roundtrip_exact"], True)
+                self.assertEqual(
                     result["systems"][0]["system_scope"], "music_quality_only"
                 )
                 self.assertFalse(result["produces_system_metrics"])
@@ -653,7 +691,9 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
             with self.subTest(case=case):
                 case_root = self.root / f"offline-geometry-{case}"
                 postjoin_gt = case_root / "postjoin_gt.mid"
+                canonical_gt = case_root / "canonical_gt.mid"
                 self._write_postjoin_gt(gt_full, postjoin_gt)
+                self._write_postjoin_gt(gt_full, canonical_gt)
                 midi = pretty_midi.PrettyMIDI(str(postjoin_gt))
                 accompaniment = next(
                     track for track in midi.instruments if track.name == "Accompaniment"
@@ -686,6 +726,9 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
                                 "system_id": "beat-offline",
                                 "postjoin_generated_midi": str(generated),
                                 "postjoin_gt_midi": str(postjoin_gt),
+                                "source_npz_sha256": (
+                                    self._cohort_source_npz_sha256(cohort)
+                                ),
                                 "run_status": "complete",
                                 "failure_reason": "",
                             }
@@ -694,28 +737,87 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
                     encoding="utf-8",
                 )
                 output = case_root / "output"
-                if should_pass:
-                    result = prepare_matched_music_eval(
+                result = prepare_matched_music_eval(
+                    cohort_manifest=cohort,
+                    offline_manifest=offline,
+                    output_dir=output,
+                    expected_piece_count=1,
+                    expected_seeds=("0",),
+                )
+                self.assertEqual(result["preparation_status"], "success")
+                audit_row = result["trials"][0]
+                self.assertIs(audit_row["offline_gt_roundtrip_exact"], should_pass)
+
+                canonical_midi = pretty_midi.PrettyMIDI(str(canonical_gt))
+                canonical_acc = next(
+                    track
+                    for track in canonical_midi.instruments
+                    if track.name == "Accompaniment"
+                )
+                metric_gt = pretty_midi.PrettyMIDI(
+                    str(output / audit_row["all_trials_metric_gt_midi"])
+                )
+                self.assertEqual(
+                    [track.name for track in metric_gt.instruments], ["Piano"]
+                )
+                expected_geometry = sorted(
+                    (note.pitch, round(note.start, 6), round(note.end, 6))
+                    for note in canonical_acc.notes
+                )
+                actual_geometry = sorted(
+                    (note.pitch, round(note.start, 6), round(note.end, 6))
+                    for note in metric_gt.instruments[0].notes
+                )
+                self.assertEqual(actual_geometry, expected_geometry)
+
+    def test_offline_source_npz_identity_missing_or_mismatch_blocks(self) -> None:
+        cohort, _, gt_full = self._cohort()
+        expected_hash = self._cohort_source_npz_sha256(cohort)
+        for case, source_hash, message in (
+            ("missing", None, "source_npz_sha256 is required"),
+            ("mismatch", "0" * 64, "does not match cohort"),
+        ):
+            with self.subTest(case=case):
+                case_root = self.root / f"offline-source-{case}"
+                generated = case_root / "generated.mid"
+                postjoin_gt = case_root / "postjoin_gt.mid"
+                self._write_midi(
+                    generated,
+                    melody=[(60, 1.0, 2.0)],
+                    accompaniment=[(48, 2.0, 3.0)],
+                )
+                self._write_postjoin_gt(gt_full, postjoin_gt)
+                row = {
+                    "piece_id": "piece-a",
+                    "seed": "0",
+                    "system_id": "beat-offline",
+                    "postjoin_generated_midi": str(generated),
+                    "postjoin_gt_midi": str(postjoin_gt),
+                    "run_status": "complete",
+                    "failure_reason": "",
+                }
+                if source_hash is not None:
+                    row["source_npz_sha256"] = source_hash
+                manifest = case_root / "offline.json"
+                manifest.write_text(json.dumps([row]), encoding="utf-8")
+                output = case_root / "output"
+                with self.assertRaises(PreparationBlockedError):
+                    prepare_matched_music_eval(
                         cohort_manifest=cohort,
-                        offline_manifest=offline,
+                        offline_manifest=manifest,
                         output_dir=output,
                         expected_piece_count=1,
                         expected_seeds=("0",),
                     )
-                    self.assertEqual(result["preparation_status"], "success")
-                else:
-                    with self.assertRaises(PreparationBlockedError):
-                        prepare_matched_music_eval(
-                            cohort_manifest=cohort,
-                            offline_manifest=offline,
-                            output_dir=output,
-                            expected_piece_count=1,
-                            expected_seeds=("0",),
-                        )
-                    result = json.loads(
-                        (output / "prepared_manifest.json").read_text(encoding="utf-8")
-                    )
-                    self.assertIn("does not match", result["blockers"][0])
+                result = json.loads(
+                    (output / "prepared_manifest.json").read_text(encoding="utf-8")
+                )
+                self.assertIn(message, result["blockers"][0])
+                self.assertEqual(
+                    result["trials"][0]["cohort_source_npz_sha256"],
+                    expected_hash,
+                )
+                self.assertFalse((output / "beat-offline").exists())
 
     def test_offline_out_of_window_and_empty_melody_are_rejected(self) -> None:
         cohort, _, _ = self._cohort()
@@ -737,6 +839,7 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
             "system_id": "offline",
             "postjoin_generated_midi": str(generated),
             "postjoin_gt_midi": str(gt),
+            "source_npz_sha256": self._cohort_source_npz_sha256(cohort),
             "run_status": "complete",
             "failure_reason": "",
         }
@@ -765,6 +868,7 @@ class PrepareMatchedMusicEvalTest(unittest.TestCase):
                         "system_id": "beat-offline",
                         "postjoin_generated_midi": "",
                         "postjoin_gt_midi": "",
+                        "source_npz_sha256": self._cohort_source_npz_sha256(cohort),
                         "status": "failed",
                         "failure_reason": "offline inference failed",
                     }

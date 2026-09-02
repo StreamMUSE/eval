@@ -178,7 +178,8 @@ hashes are not interchangeable. Cohort Melody and GT file hashes are both
 verified. The cohort Melody MIDI must contain exactly one non-empty named
 `Melody` instrument, no other non-empty music instruments, and a non-empty
 post-join window. Its cropped Melody events must exactly match the cropped
-Melody events in the cohort GT.
+Melody events in the cohort GT. Every cohort sample also declares
+`source_npz_sha256`; when `source_npz` is present its file hash is verified.
 
 ```bash
 PYTHONPATH=src python -m eval_toolkit.prepare_matched_music_eval \
@@ -217,9 +218,14 @@ interchanged.
 Offline rows must declare already-postjoin generated/GT MIDI. Their timing is
 validated but never shifted a second time, and their system scope is recorded
 as `music_quality_only`; this tool never produces offline system metrics.
-Offline GT equivalence uses track role, note count, pitch, onset, and end time,
-but deliberately ignores MIDI velocity because the four-channel corpus has no
-velocity semantics. Pitch or timing/duration changes still fail validation.
+Each offline row must carry the same `source_npz_sha256` as its cohort piece;
+this strict equality is the canonical-source identity contract. Strict
+PatchCodec reserved-ID replacement can make a MIDI round trip differ from the
+canonical NPZ representation, so offline GT geometry is diagnostic only.
+`offline_gt_roundtrip_exact` compares track role, note count, pitch, onset, and
+end time while ignoring velocity; a false value does not block publication.
+Metric-ready GT is always rebuilt from the cohort, never from offline
+round-trip MIDI.
 
 ## Supported Metric Types
 

@@ -77,6 +77,10 @@ AUDIT_FIELDS = (
     "cohort_full_gt_sha256",
     "cohort_postjoin_melody_note_count",
     "cohort_postjoin_melody_sha256",
+    "cohort_source_npz",
+    "cohort_source_npz_sha256",
+    "trial_source_npz_sha256",
+    "offline_gt_roundtrip_exact",
     "generated_sha256",
     "metric_gt_sha256",
     "generated_mel_note_count",
@@ -117,6 +121,8 @@ class CohortPiece:
     gt_midi_sha256: str
     postjoin_gt: WindowMidi
     postjoin_melody_sha256: str
+    source_npz: Path | None
+    source_npz_sha256: str
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,7 @@ class Trial:
     generated_midi: Path | None = None
     gt_midi: Path | None = None
     melody_input_sha256: str | None = None
+    source_npz_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -279,6 +286,9 @@ def load_cohort_manifest(path: Path) -> dict[str, CohortPiece]:
                 raw, "melody_midi_sha256", context
             ).lower(),
             "gt_midi_sha256": _require_string(raw, "gt_midi_sha256", context).lower(),
+            "source_npz_sha256": _require_string(
+                raw, "source_npz_sha256", context
+            ).lower(),
         }
         for field, declared_hash in declared_hashes.items():
             if not re.fullmatch(r"[0-9a-f]{64}", declared_hash):
@@ -300,6 +310,18 @@ def load_cohort_manifest(path: Path) -> dict[str, CohortPiece]:
                 f"{context}: GT MIDI file hash mismatch; declared "
                 f"{declared_hashes['gt_midi_sha256']}, actual {actual_gt_hash}"
             )
+        source_npz_raw = _optional_string(raw, "source_npz")
+        source_npz = _resolve_path(source_npz_raw, path) if source_npz_raw else None
+        if source_npz is not None:
+            if not source_npz.is_file():
+                raise PreparationError(f"{context}: source_npz not found: {source_npz}")
+            actual_source_npz_hash = file_sha256(source_npz)
+            if actual_source_npz_hash != declared_hashes["source_npz_sha256"]:
+                raise PreparationError(
+                    f"{context}: source NPZ file hash mismatch; declared "
+                    f"{declared_hashes['source_npz_sha256']}, actual "
+                    f"{actual_source_npz_hash}"
+                )
         postjoin_gt, postjoin_melody_sha256 = _validate_cohort_melody_pair(melody, gt)
         pieces[piece_id] = CohortPiece(
             piece_id,
@@ -309,6 +331,8 @@ def load_cohort_manifest(path: Path) -> dict[str, CohortPiece]:
             actual_gt_hash,
             postjoin_gt,
             postjoin_melody_sha256,
+            source_npz,
+            declared_hashes["source_npz_sha256"],
         )
 
     if not pieces:
@@ -385,6 +409,11 @@ def load_offline_manifest(path: Path) -> list[Trial]:
         status, reason = _parse_status(row, context)
         generated_raw = _optional_string(row, "postjoin_generated_midi")
         gt_raw = _optional_string(row, "postjoin_gt_midi")
+        source_npz_hash = _optional_string(row, "source_npz_sha256").lower()
+        if source_npz_hash and not re.fullmatch(r"[0-9a-f]{64}", source_npz_hash):
+            raise PreparationError(
+                f"{context}: source_npz_sha256 must contain exactly 64 hex digits"
+            )
         generated = _resolve_path(generated_raw, path) if generated_raw else None
         gt = _resolve_path(gt_raw, path) if gt_raw else None
         if status == "complete" and (generated is None or gt is None):
@@ -404,6 +433,7 @@ def load_offline_manifest(path: Path) -> list[Trial]:
                 row_number=row_number,
                 generated_midi=generated,
                 gt_midi=gt,
+                source_npz_sha256=source_npz_hash or None,
             )
         )
     return trials
@@ -931,6 +961,14 @@ def _empty_audit(trial: Trial, cohort_piece: CohortPiece) -> dict[str, Any]:
         "cohort_full_gt_sha256": cohort_piece.gt_midi_sha256,
         "cohort_postjoin_melody_note_count": len(cohort_piece.postjoin_gt.melody),
         "cohort_postjoin_melody_sha256": cohort_piece.postjoin_melody_sha256,
+        "cohort_source_npz": (
+            str(cohort_piece.source_npz)
+            if cohort_piece.source_npz is not None
+            else None
+        ),
+        "cohort_source_npz_sha256": cohort_piece.source_npz_sha256,
+        "trial_source_npz_sha256": trial.source_npz_sha256,
+        "offline_gt_roundtrip_exact": None,
         "generated_sha256": None,
         "metric_gt_sha256": None,
         "generated_mel_note_count": None,
@@ -1052,15 +1090,20 @@ def prepare_matched_music_eval(
                 else:
                     if trial.generated_midi is None or trial.gt_midi is None:
                         raise PreparationError("complete offline row lacks MIDI paths")
+                    if trial.source_npz_sha256 is None:
+                        raise PreparationError(
+                            "offline source_npz_sha256 is required for canonical identity"
+                        )
+                    if trial.source_npz_sha256 != cohort_piece.source_npz_sha256:
+                        raise PreparationError(
+                            "offline source_npz_sha256 does not match cohort canonical "
+                            "source NPZ"
+                        )
                     source_generated = trial.generated_midi
                     provided_gt = _read_offline_postjoin_gt(trial.gt_midi)
-                    if _canonical_note_geometry(
+                    audit["offline_gt_roundtrip_exact"] = _canonical_note_geometry(
                         provided_gt
-                    ) != _canonical_note_geometry(cohort_gt.accompaniment):
-                        raise PreparationError(
-                            "offline postjoin_gt_midi does not match the cohort GT "
-                            "post-join window"
-                        )
+                    ) == _canonical_note_geometry(cohort_gt.accompaniment)
                     generated = _extract_window(
                         source_generated,
                         already_postjoin=True,
