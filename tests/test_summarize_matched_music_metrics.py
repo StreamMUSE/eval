@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from eval_toolkit.summarize_matched_music_metrics import (
@@ -147,6 +149,42 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
                         },
                     },
                     "details": details,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def _write_nll(
+        self,
+        path: Path,
+        values_by_system: dict[
+            str, dict[tuple[str, str], tuple[float, int]]
+        ],
+    ) -> Path:
+        systems: dict[str, object] = {}
+        for system_id, values in values_by_system.items():
+            systems[system_id] = {
+                "trials": [
+                    {
+                        "system_id": system_id,
+                        "piece_id": piece_id,
+                        "seed": seed,
+                        "basename": f"piece-{piece_id}__seed-{seed}.mid",
+                        "total_nll": total_nll,
+                        "avg_nll": total_nll / total_tokens,
+                        "total_tokens": total_tokens,
+                    }
+                    for (piece_id, seed), (total_nll, total_tokens) in sorted(
+                        values.items()
+                    )
+                ]
+            }
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "streammuse.matched_continuation_nll.v1",
+                    "systems": systems,
                 }
             ),
             encoding="utf-8",
@@ -647,6 +685,315 @@ class SummarizeMatchedMusicMetricsTest(unittest.TestCase):
                 expected_seeds=("0", "1"),
                 bootstrap_replicates=10,
             )
+
+    def test_nll_wavg_cli_and_piece_cluster_bootstrap_are_exact(self) -> None:
+        grid = self._grid()
+        audit = self._write_audit({"A": grid, "B": grid})
+        metrics_paths = {
+            system_id: self._write_metrics(
+                self.root / f"nll-{system_id}.json", self._valid_details(grid)
+            )
+            for system_id in ("A", "B")
+        }
+        values_a = {
+            ("p1", "0"): (2.0, 1),
+            ("p1", "1"): (6.0, 3),
+            ("p2", "0"): (16.0, 2),
+            ("p2", "1"): (4.0, 4),
+        }
+        values_b = {
+            ("p1", "0"): (1.0, 1),
+            ("p1", "1"): (3.0, 3),
+            ("p2", "0"): (4.0, 2),
+            ("p2", "1"): (8.0, 4),
+        }
+        nll_path = self._write_nll(
+            self.root / "nll.json", {"A": values_a, "B": values_b}
+        )
+        output_json = self.root / "nll-summary.json"
+        output_csv = self.root / "nll-summary.csv"
+        replicates = 200
+        bootstrap_seed = 23
+
+        exit_code = main(
+            [
+                "--audit",
+                str(audit),
+                "--metrics",
+                f"A={metrics_paths['A']}",
+                "--metrics",
+                f"B={metrics_paths['B']}",
+                "--nll-json",
+                str(nll_path),
+                "--output-json",
+                str(output_json),
+                "--output-csv",
+                str(output_csv),
+                "--quality-scope",
+                "common_valid_intersection",
+                "--expected-piece-count",
+                "2",
+                "--expected-seeds",
+                "0,1",
+                "--bootstrap-replicates",
+                str(replicates),
+                "--bootstrap-seed",
+                str(bootstrap_seed),
+            ]
+        )
+        self.assertEqual(exit_code, 0)
+        summary = json.loads(output_json.read_text(encoding="utf-8"))
+        nll = summary["systems"]["A"]["metrics"]["nll_wavg"]
+        self.assertAlmostEqual(nll["estimate"], 28.0 / 10.0)
+        self.assertEqual(nll["numerator"], 28.0)
+        self.assertEqual(nll["denominator"], 10)
+        self.assertEqual(nll["scope"], "common_valid_intersection")
+        self.assertEqual(nll["bootstrap_valid_replicates"], replicates)
+
+        rng = np.random.default_rng(bootstrap_seed)
+        rng.integers(0, 2, size=(replicates, 2), dtype=np.int64)
+        quality_draws = rng.integers(
+            0, 2, size=(replicates, 2), dtype=np.int64
+        )
+        expected_replicates = []
+        for draw in quality_draws:
+            weights = np.bincount(draw, minlength=2)
+            expected_replicates.append(
+                float(weights @ np.array([8.0, 20.0]))
+                / int(weights @ np.array([4, 6]))
+            )
+        expected_low, expected_high = np.percentile(
+            expected_replicates, [2.5, 97.5]
+        )
+        self.assertAlmostEqual(nll["ci_low"], expected_low)
+        self.assertAlmostEqual(nll["ci_high"], expected_high)
+
+        repeated = summarize_matched_music_metrics(
+            audit_path=audit,
+            metrics_paths={"B": metrics_paths["B"], "A": metrics_paths["A"]},
+            expected_piece_count=2,
+            expected_seeds=("0", "1"),
+            bootstrap_replicates=replicates,
+            bootstrap_seed=bootstrap_seed,
+            quality_scope="common_valid_intersection",
+            nll_json_path=nll_path,
+        )
+        self.assertEqual(summary["bootstrap"], repeated["bootstrap"])
+        self.assertEqual(summary["systems"], repeated["systems"])
+
+        with output_csv.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 16)
+        nll_rows = [row for row in rows if row["metric"] == "nll_wavg"]
+        self.assertEqual([row["system_id"] for row in nll_rows], ["A", "B"])
+        self.assertEqual(nll_rows[0]["denominator"], "10")
+
+    def test_nll_rejects_system_and_common_valid_key_mismatches(self) -> None:
+        grid = self._grid()
+        audit = self._write_audit({"A": grid, "B": grid})
+        metrics_paths = {
+            system_id: self._write_metrics(
+                self.root / f"key-{system_id}.json", self._valid_details(grid)
+            )
+            for system_id in ("A", "B")
+        }
+        values = {key: (2.0, 2) for key in grid}
+        base_path = self._write_nll(
+            self.root / "key-base.json", {"A": values, "B": values}
+        )
+        base_payload = json.loads(base_path.read_text(encoding="utf-8"))
+        cases = (
+            (
+                "missing-system",
+                lambda payload: payload["systems"].pop("B"),
+                "systems do not exactly match",
+            ),
+            (
+                "extra-system",
+                lambda payload: payload["systems"].update(
+                    {"C": {"trials": []}}
+                ),
+                "systems do not exactly match",
+            ),
+            (
+                "missing-key",
+                lambda payload: payload["systems"]["A"]["trials"].pop(),
+                "do not exactly match common-valid",
+            ),
+            (
+                "extra-key",
+                lambda payload: payload["systems"]["A"]["trials"].append(
+                    {
+                        "system_id": "A",
+                        "piece_id": "extra",
+                        "seed": "0",
+                        "basename": "extra.mid",
+                        "total_nll": 1.0,
+                        "avg_nll": 1.0,
+                        "total_tokens": 1,
+                    }
+                ),
+                "do not exactly match common-valid",
+            ),
+            (
+                "duplicate-key",
+                lambda payload: payload["systems"]["A"]["trials"].append(
+                    dict(payload["systems"]["A"]["trials"][0])
+                ),
+                "duplicate NLL key",
+            ),
+            (
+                "trial-system",
+                lambda payload: payload["systems"]["A"]["trials"][0].update(
+                    {"system_id": "B"}
+                ),
+                "does not match container",
+            ),
+        )
+        for name, mutate, message in cases:
+            with self.subTest(name=name):
+                payload = json.loads(json.dumps(base_payload))
+                mutate(payload)
+                path = self.root / f"{name}.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaisesRegex(MusicSummaryValidationError, message):
+                    summarize_matched_music_metrics(
+                        audit_path=audit,
+                        metrics_paths=metrics_paths,
+                        expected_piece_count=2,
+                        expected_seeds=("0", "1"),
+                        bootstrap_replicates=10,
+                        quality_scope="common_valid_intersection",
+                        nll_json_path=path,
+                    )
+
+    def test_nll_bootstrap_always_samples_common_valid_pieces(self) -> None:
+        grid = self._grid(default=False)
+        grid[("p1", "0")] = True
+        grid[("p1", "1")] = True
+        audit = self._write_audit({"A": grid, "B": grid})
+        metrics_paths = {
+            system_id: self._write_metrics(
+                self.root / f"scope-{system_id}.json",
+                self._valid_details(grid),
+            )
+            for system_id in ("A", "B")
+        }
+        values = {
+            ("p1", "0"): (2.0, 1),
+            ("p1", "1"): (9.0, 3),
+        }
+        nll_path = self._write_nll(
+            self.root / "scope-nll.json", {"A": values, "B": values}
+        )
+        kwargs = {
+            "audit_path": audit,
+            "metrics_paths": metrics_paths,
+            "expected_piece_count": 2,
+            "expected_seeds": ("0", "1"),
+            "bootstrap_replicates": 37,
+            "bootstrap_seed": 13,
+            "nll_json_path": nll_path,
+        }
+        per_system = summarize_matched_music_metrics(**kwargs)
+        common = summarize_matched_music_metrics(
+            **kwargs, quality_scope="common_valid_intersection"
+        )
+        for system_id in ("A", "B"):
+            per_system_nll = per_system["systems"][system_id]["metrics"][
+                "nll_wavg"
+            ]
+            common_nll = common["systems"][system_id]["metrics"]["nll_wavg"]
+            self.assertEqual(per_system_nll, common_nll)
+            self.assertEqual(per_system_nll["estimate"], 11.0 / 4.0)
+            self.assertEqual(per_system_nll["bootstrap_valid_replicates"], 37)
+
+    def test_nll_rejects_invalid_schema_and_numeric_values(self) -> None:
+        grid = self._grid()
+        audit = self._write_audit({"A": grid})
+        metrics = self._write_metrics(
+            self.root / "numeric-A.json", self._valid_details(grid)
+        )
+        values = {key: (2.0, 2) for key in grid}
+        base_path = self._write_nll(
+            self.root / "numeric-base.json", {"A": values}
+        )
+        base_payload = json.loads(base_path.read_text(encoding="utf-8"))
+
+        def set_trial(field, value):
+            return lambda payload: payload["systems"]["A"]["trials"][0].update(
+                {field: value}
+            )
+
+        cases = (
+            (
+                "schema",
+                lambda payload: payload.update({"schema_version": "wrong"}),
+                "schema_version",
+            ),
+            ("negative-total", set_trial("total_nll", -1.0), "nonnegative"),
+            ("nan-total", set_trial("total_nll", float("nan")), "finite number"),
+            ("zero-tokens", set_trial("total_tokens", 0), "must be positive"),
+            ("float-tokens", set_trial("total_tokens", 2.0), "must be an integer"),
+            ("negative-avg", set_trial("avg_nll", -1.0), "nonnegative"),
+            ("nan-avg", set_trial("avg_nll", float("nan")), "finite number"),
+            ("mismatched-avg", set_trial("avg_nll", 9.0), "does not equal"),
+        )
+        for name, mutate, message in cases:
+            with self.subTest(name=name):
+                payload = json.loads(json.dumps(base_payload))
+                mutate(payload)
+                path = self.root / f"invalid-{name}.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaisesRegex(MusicSummaryValidationError, message):
+                    summarize_matched_music_metrics(
+                        audit_path=audit,
+                        metrics_paths={"A": metrics},
+                        expected_piece_count=2,
+                        expected_seeds=("0", "1"),
+                        bootstrap_replicates=10,
+                        quality_scope="common_valid_intersection",
+                        nll_json_path=path,
+                    )
+
+        rounded_payload = json.loads(json.dumps(base_payload))
+        rounded_payload["systems"]["A"]["trials"][0]["avg_nll"] += 5e-7
+        rounded_path = self.root / "rounded-avg.json"
+        rounded_path.write_text(json.dumps(rounded_payload), encoding="utf-8")
+        summary = summarize_matched_music_metrics(
+            audit_path=audit,
+            metrics_paths={"A": metrics},
+            expected_piece_count=2,
+            expected_seeds=("0", "1"),
+            bootstrap_replicates=10,
+            quality_scope="common_valid_intersection",
+            nll_json_path=rounded_path,
+        )
+        self.assertIn("nll_wavg", summary["systems"]["A"]["metrics"])
+
+    def test_omitting_nll_json_preserves_existing_summary_structure(self) -> None:
+        grid = self._grid()
+        audit = self._write_audit({"A": grid})
+        metrics = self._write_metrics(
+            self.root / "compat-A.json", self._valid_details(grid)
+        )
+        kwargs = {
+            "audit_path": audit,
+            "metrics_paths": {"A": metrics},
+            "expected_piece_count": 2,
+            "expected_seeds": ("0", "1"),
+            "bootstrap_replicates": 10,
+            "bootstrap_seed": 4,
+        }
+        original_call = summarize_matched_music_metrics(**kwargs)
+        explicit_none = summarize_matched_music_metrics(
+            **kwargs, nll_json_path=None
+        )
+        self.assertEqual(original_call, explicit_none)
+        self.assertEqual(
+            set(original_call["systems"]["A"]["metrics"]),
+            {"valid_output_rate", "pitch_jsd", "onset_jsd", "duration_jsd", "cr", "ur", "fmd"},
+        )
 
     def test_duplicate_metrics_mapping_is_rejected(self) -> None:
         with self.assertRaisesRegex(MusicSummaryValidationError, "duplicate"):

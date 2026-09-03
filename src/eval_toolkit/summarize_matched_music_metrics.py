@@ -20,6 +20,7 @@ EXPECTED_SEEDS = ("0", "1", "2")
 DEFAULT_BOOTSTRAP_REPLICATES = 10_000
 DEFAULT_BOOTSTRAP_SEED = 0
 QUALITY_SCOPES = ("per_system_valid", "common_valid_intersection")
+NLL_SCHEMA_VERSION = "streammuse.matched_continuation_nll.v1"
 FORMAL_EVALUATION_DURATION_SECONDS = 12.0
 FORMAL_DURATION_HISTOGRAM_UPPER_BOUND_SECONDS = 12.0
 DETAIL_METRICS = {
@@ -75,6 +76,14 @@ class SystemInput:
     metric_config_fingerprint: str
 
 
+@dataclass(frozen=True)
+class NllTrial:
+    piece_id: str
+    seed: str
+    total_nll: float
+    total_tokens: int
+
+
 def _finite_number(value: Any, context: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise MusicSummaryValidationError(f"{context} must be a finite number")
@@ -114,6 +123,12 @@ def _strict_sha256(value: Any, context: str) -> str:
             f"{context} must be 64 lowercase hexadecimal characters"
         )
     return normalized
+
+
+def _nonempty_string(value: Any, context: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise MusicSummaryValidationError(f"{context} must be a non-empty string")
+    return value.strip()
 
 
 def _nested_optional(root: Any, path: Sequence[str]) -> Any:
@@ -165,6 +180,141 @@ def parse_metrics_mapping(values: Sequence[str]) -> dict[str, Path]:
     if not mappings:
         raise MusicSummaryValidationError("at least one --metrics mapping is required")
     return mappings
+
+
+def _load_matched_nll(
+    path: Path,
+    *,
+    system_ids: Sequence[str],
+    common_valid_keys: set[tuple[str, str]],
+) -> dict[str, tuple[NllTrial, ...]]:
+    payload = _read_json(path.resolve())
+    if not isinstance(payload, Mapping):
+        raise MusicSummaryValidationError(f"NLL root must be an object: {path}")
+    if payload.get("schema_version") != NLL_SCHEMA_VERSION:
+        raise MusicSummaryValidationError(
+            f"NLL schema_version must be {NLL_SCHEMA_VERSION!r}: {path}"
+        )
+    systems = payload.get("systems")
+    if not isinstance(systems, Mapping):
+        raise MusicSummaryValidationError(f"NLL systems must be an object: {path}")
+
+    expected_systems = set(system_ids)
+    actual_systems = set(systems)
+    if actual_systems != expected_systems:
+        raise MusicSummaryValidationError(
+            "NLL systems do not exactly match metrics systems; "
+            f"missing={sorted(expected_systems - actual_systems)}, "
+            f"extra={sorted(actual_systems - expected_systems)}"
+        )
+    if not common_valid_keys:
+        raise MusicSummaryValidationError(
+            "NLL scoring requires a non-empty common-valid intersection"
+        )
+
+    required_fields = {
+        "system_id",
+        "piece_id",
+        "seed",
+        "basename",
+        "total_nll",
+        "avg_nll",
+        "total_tokens",
+    }
+    loaded: dict[str, tuple[NllTrial, ...]] = {}
+    for system_id in system_ids:
+        system_payload = systems[system_id]
+        if not isinstance(system_payload, Mapping):
+            raise MusicSummaryValidationError(
+                f"NLL system {system_id!r} must be an object"
+            )
+        raw_trials = system_payload.get("trials")
+        if not isinstance(raw_trials, list):
+            raise MusicSummaryValidationError(
+                f"NLL system {system_id!r} trials must be a list"
+            )
+
+        trials: list[NllTrial] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for index, raw_trial in enumerate(raw_trials):
+            context = f"NLL {system_id!r} trial {index}"
+            if not isinstance(raw_trial, Mapping):
+                raise MusicSummaryValidationError(f"{context} must be an object")
+            missing_fields = sorted(required_fields - set(raw_trial))
+            if missing_fields:
+                raise MusicSummaryValidationError(
+                    f"{context} is missing fields: {', '.join(missing_fields)}"
+                )
+            trial_system = _nonempty_string(
+                raw_trial.get("system_id"), f"{context} system_id"
+            )
+            if trial_system != system_id:
+                raise MusicSummaryValidationError(
+                    f"{context} system_id {trial_system!r} does not match "
+                    f"container {system_id!r}"
+                )
+            piece_id = _nonempty_string(
+                raw_trial.get("piece_id"), f"{context} piece_id"
+            )
+            seed = _nonempty_string(raw_trial.get("seed"), f"{context} seed")
+            _nonempty_string(raw_trial.get("basename"), f"{context} basename")
+            key = (piece_id, seed)
+            if key in seen_keys:
+                raise MusicSummaryValidationError(
+                    f"duplicate NLL key for {system_id}/{piece_id}/seed {seed}"
+                )
+            seen_keys.add(key)
+
+            total_nll = _finite_number(
+                raw_trial.get("total_nll"), f"{context} total_nll"
+            )
+            if total_nll < 0.0:
+                raise MusicSummaryValidationError(
+                    f"{context} total_nll must be nonnegative"
+                )
+            total_tokens = _strict_integer(
+                raw_trial.get("total_tokens"), f"{context} total_tokens"
+            )
+            if total_tokens <= 0:
+                raise MusicSummaryValidationError(
+                    f"{context} total_tokens must be positive"
+                )
+            avg_nll = _finite_number(
+                raw_trial.get("avg_nll"), f"{context} avg_nll"
+            )
+            if avg_nll < 0.0:
+                raise MusicSummaryValidationError(
+                    f"{context} avg_nll must be nonnegative"
+                )
+            if not math.isclose(
+                avg_nll,
+                total_nll / total_tokens,
+                rel_tol=1e-6,
+                abs_tol=1e-9,
+            ):
+                raise MusicSummaryValidationError(
+                    f"{context} avg_nll does not equal total_nll/total_tokens"
+                )
+            trials.append(
+                NllTrial(
+                    piece_id=piece_id,
+                    seed=seed,
+                    total_nll=total_nll,
+                    total_tokens=total_tokens,
+                )
+            )
+
+        if seen_keys != common_valid_keys:
+            missing = sorted(common_valid_keys - seen_keys)
+            extra = sorted(seen_keys - common_valid_keys)
+            raise MusicSummaryValidationError(
+                f"NLL keys for system {system_id!r} do not exactly match "
+                f"common-valid audit keys; missing={missing[:5]}, extra={extra[:5]}"
+            )
+        loaded[system_id] = tuple(
+            sorted(trials, key=lambda trial: (trial.piece_id, trial.seed))
+        )
+    return loaded
 
 
 def load_matched_audit(
@@ -639,6 +789,7 @@ def summarize_matched_music_metrics(
     bootstrap_replicates: int = DEFAULT_BOOTSTRAP_REPLICATES,
     bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
     quality_scope: str = "per_system_valid",
+    nll_json_path: Path | None = None,
 ) -> dict[str, Any]:
     if bootstrap_replicates <= 0:
         raise MusicSummaryValidationError("bootstrap_replicates must be positive")
@@ -666,6 +817,15 @@ def summarize_matched_music_metrics(
     }
     common_quality_keys = set.intersection(
         *(valid_keys_by_system[system_id] for system_id in system_ids)
+    )
+    nll_inputs = (
+        _load_matched_nll(
+            Path(nll_json_path),
+            system_ids=system_ids,
+            common_valid_keys=common_quality_keys,
+        )
+        if nll_json_path is not None
+        else None
     )
     quality_keys_by_system = {
         system_id: (
@@ -731,6 +891,30 @@ def summarize_matched_music_metrics(
     quality_piece_to_index = {
         piece_id: index for index, piece_id in enumerate(quality_pieces)
     }
+    if nll_inputs is not None:
+        common_valid_pieces = tuple(
+            piece_id
+            for piece_id in pieces
+            if any(key[0] == piece_id for key in common_quality_keys)
+        )
+        common_valid_draws = (
+            quality_draws
+            if quality_scope == "common_valid_intersection"
+            else rng.integers(
+                0,
+                len(common_valid_pieces),
+                size=(bootstrap_replicates, len(common_valid_pieces)),
+                dtype=np.int64,
+            )
+        )
+        common_valid_piece_to_index = {
+            piece_id: index
+            for index, piece_id in enumerate(common_valid_pieces)
+        }
+    else:
+        common_valid_pieces = ()
+        common_valid_draws = np.empty((0, 0), dtype=np.int64)
+        common_valid_piece_to_index = {}
     detail_metric_scope = (
         "common_valid_intersection"
         if quality_scope == "common_valid_intersection"
@@ -825,6 +1009,39 @@ def summarize_matched_music_metrics(
                 else "dataset_level_valid_output"
             ),
         )
+        if nll_inputs is not None:
+            piece_nll_sums = np.zeros(
+                len(common_valid_pieces), dtype=np.float64
+            )
+            piece_token_sums = np.zeros(
+                len(common_valid_pieces), dtype=np.int64
+            )
+            for trial in nll_inputs[system_id]:
+                piece_index = common_valid_piece_to_index[trial.piece_id]
+                piece_nll_sums[piece_index] += trial.total_nll
+                piece_token_sums[piece_index] += trial.total_tokens
+
+            total_nll = float(piece_nll_sums.sum())
+            total_tokens = int(piece_token_sums.sum())
+            nll_replicates: list[float] = []
+            for draw in common_valid_draws:
+                weights = np.bincount(
+                    draw, minlength=len(common_valid_pieces)
+                )
+                replicate_tokens = int(weights @ piece_token_sums)
+                if replicate_tokens <= 0:
+                    continue
+                replicate_nll = float(weights @ piece_nll_sums)
+                nll_replicates.append(replicate_nll / replicate_tokens)
+            metrics["nll_wavg"] = _metric_record(
+                estimate=total_nll / total_tokens,
+                ci=_percentile_ci(nll_replicates) if nll_replicates else None,
+                ci_status="computed" if nll_replicates else "not_computed",
+                valid_replicates=len(nll_replicates),
+                numerator=total_nll,
+                denominator=total_tokens,
+                scope="common_valid_intersection",
+            )
         system_results[system_id] = {
             "metrics_path": str(system_input.metrics_path),
             "metric_config_fingerprint": (
@@ -932,6 +1149,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=QUALITY_SCOPES,
         default="per_system_valid",
     )
+    parser.add_argument(
+        "--nll-json",
+        type=Path,
+        help="Optional multi-system matched continuation NLL JSON.",
+    )
     return parser
 
 
@@ -948,6 +1170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             bootstrap_replicates=args.bootstrap_replicates,
             bootstrap_seed=args.bootstrap_seed,
             quality_scope=args.quality_scope,
+            nll_json_path=args.nll_json,
         )
         write_summary_json(args.output_json, summary)
         write_flat_csv(args.output_csv, summary)
