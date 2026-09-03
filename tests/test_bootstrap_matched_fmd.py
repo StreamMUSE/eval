@@ -11,12 +11,21 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import pretty_midi
 import scipy.linalg
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from evaluate_accompaniment_metrics import (  # noqa: E402
+    _build_accompaniment_only_midi as official_generated_accompaniment_midi,
+)
+from evaluate_accompaniment_metrics import (  # noqa: E402
+    _build_ground_truth_accompaniment_midi as official_groundtruth_accompaniment_midi,
+)
 from eval_toolkit.bootstrap_matched_fmd import (
     BootstrapFMDValidationError,
+    FEATURE_CACHE_SCHEMA_VERSION,
+    FEATURE_PREPARATION_CONTRACT,
     bootstrap_matched_fmd,
     frechet_distance_from_precomputed,
     frechet_distance_low_rank,
@@ -57,13 +66,39 @@ def _vector_from_sha256(value: str) -> np.ndarray:
     return np.asarray([(word % 1000) / 97.0 for word in words], dtype=np.float64)
 
 
+def _midi_summary(path: Path) -> list[dict[str, object]]:
+    midi = pretty_midi.PrettyMIDI(str(path))
+    return [
+        {
+            "name": instrument.name,
+            "program": instrument.program,
+            "is_drum": instrument.is_drum,
+            "notes": [
+                (
+                    note.pitch,
+                    round(note.start, 6),
+                    round(note.end, 6),
+                    note.velocity,
+                )
+                for note in instrument.notes
+            ],
+        }
+        for instrument in midi.instruments
+    ]
+
+
 class FakeExtractor:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.paths: list[Path] = []
+        self.track_summaries: dict[str, list[dict[str, object]]] = {}
 
     def extract_feature(self, path: Path) -> np.ndarray:
-        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        path = Path(path)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
         self.calls.append(digest)
+        self.paths.append(path)
+        self.track_summaries[digest] = _midi_summary(path)
         return _vector_from_sha256(digest)[None, :]
 
 
@@ -125,6 +160,33 @@ class LowRankFMDTest(unittest.TestCase):
                 self.assertLess(abs(low_rank - direct), 1e-8)
                 self.assertLess(abs(precomputed_score - direct), 1e-8)
 
+    def test_low_rank_matches_package_mle_compute_fmd_for_identical_matrix(
+        self,
+    ) -> None:
+        from frechet_music_distance import FrechetMusicDistance
+        from frechet_music_distance.gaussian_estimators import MaxLikelihoodEstimator
+
+        class IdentityExtractor:
+            pass
+
+        rng = np.random.default_rng(20260203)
+        features = rng.normal(size=(7, 11))
+        metric = FrechetMusicDistance(
+            feature_extractor=IdentityExtractor(),
+            gaussian_estimator=MaxLikelihoodEstimator(),
+            verbose=False,
+        )
+        mean, covariance = metric._gaussian_estimator.estimate_parameters(features)
+
+        self.assertTrue(np.array_equal(mean, np.mean(features, axis=0)))
+        self.assertTrue(np.array_equal(covariance, np.cov(features, rowvar=False)))
+
+        package_score = metric._compute_fmd(mean, mean, covariance, covariance)
+        low_rank = frechet_distance_low_rank(features, features)
+
+        self.assertLess(abs(package_score - low_rank), 6e-5)
+        self.assertLess(abs(low_rank), 6e-5)
+
 
 class BootstrapMatchedFMDTest(unittest.TestCase):
     SYSTEMS = ("system_a", "system_b")
@@ -141,6 +203,120 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
     @staticmethod
     def _sha256(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @classmethod
+    def _instrument(
+        cls,
+        *,
+        name: str,
+        program: int,
+        notes: list[tuple[int, float, float]],
+        is_drum: bool = False,
+    ) -> pretty_midi.Instrument:
+        instrument = pretty_midi.Instrument(
+            program=program,
+            is_drum=is_drum,
+            name=name,
+        )
+        instrument.notes = [
+            pretty_midi.Note(
+                velocity=80,
+                pitch=pitch,
+                start=start,
+                end=end,
+            )
+            for pitch, start, end in notes
+        ]
+        return instrument
+
+    @classmethod
+    def _write_generated_midi(
+        cls,
+        path: Path,
+        *,
+        system_id: str,
+        piece_id: str,
+        seed: str,
+    ) -> None:
+        system_offset = cls.SYSTEMS.index(system_id)
+        piece_offset = cls.PIECES.index(piece_id)
+        seed_offset = cls.SEEDS.index(seed)
+        midi = pretty_midi.PrettyMIDI(initial_tempo=120.0)
+        midi.instruments = [
+            cls._instrument(
+                name="MeLoDy",
+                program=40,
+                notes=[(72 + piece_offset * 4 + seed_offset, 0.0, 1.0)],
+            ),
+            cls._instrument(
+                name="Accompaniment",
+                program=0,
+                notes=[
+                    (
+                        48 + system_offset * 16 + piece_offset * 4 + seed_offset,
+                        1.0,
+                        2.0,
+                    )
+                ],
+            ),
+            cls._instrument(
+                name="Drums",
+                program=0,
+                notes=[(36, 1.5, 1.75)],
+                is_drum=True,
+            ),
+        ]
+        midi.write(str(path))
+
+    @classmethod
+    def _write_groundtruth_midi(
+        cls,
+        path: Path,
+        *,
+        piece_id: str,
+        seed: str,
+    ) -> None:
+        piece_offset = cls.PIECES.index(piece_id)
+        midi = pretty_midi.PrettyMIDI(initial_tempo=120.0)
+        if seed == "0":
+            midi.instruments = [
+                cls._instrument(
+                    name="Piano",
+                    program=0,
+                    notes=[(50 + piece_offset, 1.0, 2.0)],
+                ),
+                cls._instrument(
+                    name="Strings",
+                    program=48,
+                    notes=[(62 + piece_offset, 1.25, 1.75)],
+                ),
+                cls._instrument(
+                    name="Drums",
+                    program=0,
+                    notes=[(38, 1.5, 1.75)],
+                    is_drum=True,
+                ),
+            ]
+        else:
+            midi.instruments = [
+                cls._instrument(
+                    name="Strings",
+                    program=48,
+                    notes=[(55 + piece_offset, 1.0, 2.0)],
+                ),
+                cls._instrument(
+                    name="Guitar",
+                    program=24,
+                    notes=[(67 + piece_offset, 1.5, 2.25)],
+                ),
+                cls._instrument(
+                    name="Drums",
+                    program=0,
+                    notes=[(38, 1.5, 1.75)],
+                    is_drum=True,
+                ),
+            ]
+        midi.write(str(path))
 
     def _write_manifest(
         self,
@@ -159,8 +335,17 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
                 groundtruth = common_valid / groundtruth_relative
                 generated.parent.mkdir(parents=True, exist_ok=True)
                 groundtruth.parent.mkdir(parents=True, exist_ok=True)
-                generated.write_bytes(f"generated:{system_id}:{piece_id}:{seed}".encode())
-                groundtruth.write_bytes(f"groundtruth:{piece_id}:{seed}".encode())
+                self._write_generated_midi(
+                    generated,
+                    system_id=system_id,
+                    piece_id=piece_id,
+                    seed=seed,
+                )
+                self._write_groundtruth_midi(
+                    groundtruth,
+                    piece_id=piece_id,
+                    seed=seed,
+                )
                 rows.append(
                     {
                         "piece_id": piece_id,
@@ -195,13 +380,66 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
         manifest.write_text(json.dumps(payload), encoding="utf-8")
         return manifest
 
-    def _unique_hashes(self, manifest: Path) -> set[str]:
+    def _manifest_rows(self, manifest: Path) -> list[dict[str, str]]:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
-        hashes: set[str] = set()
-        for row in payload["trials"]:
-            hashes.add(row["generated_sha256"])
-            hashes.add(row["metric_gt_sha256"])
-        return hashes
+        return payload["trials"]
+
+    @staticmethod
+    def _official_prepared_digest_and_summary(
+        source: Path,
+        role: str,
+        destination: Path,
+    ) -> tuple[str, list[dict[str, object]]]:
+        midi = pretty_midi.PrettyMIDI(str(source))
+        if role == "generated":
+            prepared = official_generated_accompaniment_midi(
+                midi,
+                ("melody",),
+                (),
+                (),
+                False,
+                False,
+            )
+        else:
+            prepared = official_groundtruth_accompaniment_midi(midi, False)
+        prepared.write(str(destination))
+        return (
+            hashlib.sha256(destination.read_bytes()).hexdigest(),
+            _midi_summary(destination),
+        )
+
+    def _official_prepared_records(
+        self,
+        manifest: Path,
+    ) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as temporary_name:
+            temporary = Path(temporary_name)
+            for index, row in enumerate(self._manifest_rows(manifest)):
+                for role, path_field, hash_field in (
+                    ("generated", "common_generated_midi", "generated_sha256"),
+                    ("groundtruth", "common_metric_gt_midi", "metric_gt_sha256"),
+                ):
+                    source = manifest.parent / row[path_field]
+                    destination = temporary / f"{index}-{role}.mid"
+                    digest, summary = self._official_prepared_digest_and_summary(
+                        source,
+                        role,
+                        destination,
+                    )
+                    records.append(
+                        {
+                            "system_id": row["system_id"],
+                            "piece_id": row["piece_id"],
+                            "seed": row["seed"],
+                            "role": role,
+                            "source_path": row[path_field],
+                            "source_sha256": row[hash_field],
+                            "digest": digest,
+                            "summary": summary,
+                        }
+                    )
+        return records
 
     def test_deterministic_clustered_ci_and_feature_cache_reuse(self) -> None:
         manifest = self._write_manifest()
@@ -220,8 +458,19 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
 
         self.assertFalse(output.exists())
         self.assertTrue(cache.is_file())
-        expected_hash_counts = Counter({digest: 1 for digest in self._unique_hashes(manifest)})
+        official_records = self._official_prepared_records(manifest)
+        expected_hash_counts = Counter(
+            {
+                record["digest"]: 1
+                for record in official_records
+            }
+        )
         self.assertEqual(Counter(extractor.calls), expected_hash_counts)
+        self.assertEqual(first["cache_provenance"]["extracted_midi_count"], 12)
+        self.assertEqual(
+            first["cache_provenance"]["unique_prepared_midi_hash_count"],
+            12,
+        )
         draws = np.random.default_rng(5).integers(
             0,
             len(self.PIECES),
@@ -282,6 +531,114 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
         self.assertEqual(published["cache_provenance"]["cache_hits"], 16)
         self.assertEqual(second["cache_provenance"]["cache_hits"], 16)
         self.assertEqual(second["cache_provenance"]["extracted_midi_count"], 0)
+
+    def test_extractor_receives_exact_official_accompaniment_only_midis(
+        self,
+    ) -> None:
+        manifest = self._write_manifest()
+        extractor = FakeExtractor()
+
+        bootstrap_matched_fmd(
+            manifest_path=manifest,
+            feature_cache_path=self.root / "features.json",
+            bootstrap_replicates=8,
+            bootstrap_seed=11,
+            feature_extractor=extractor,
+            cache_provenance=TEST_PROVENANCE,
+        )
+
+        official_records = self._official_prepared_records(manifest)
+        summaries_by_digest = {
+            record["digest"]: record["summary"]
+            for record in official_records
+        }
+        self.assertEqual(
+            Counter(extractor.calls),
+            Counter({digest: 1 for digest in summaries_by_digest}),
+        )
+        self.assertEqual(extractor.track_summaries, summaries_by_digest)
+        self.assertTrue(all(path.suffix == ".mid" for path in extractor.paths))
+
+        for record in official_records:
+            names = [
+                instrument["name"]
+                for instrument in record["summary"]  # type: ignore[index]
+            ]
+            drums = [
+                instrument["is_drum"]
+                for instrument in record["summary"]  # type: ignore[index]
+            ]
+            with self.subTest(
+                role=record["role"],
+                seed=record["seed"],
+                source=record["source_path"],
+            ):
+                self.assertFalse(any(drums))
+                if record["role"] == "generated":
+                    self.assertEqual(names, ["Accompaniment"])
+                elif record["seed"] == "0":
+                    self.assertEqual(names, ["Piano"])
+                else:
+                    self.assertEqual(names, ["Strings", "Guitar"])
+
+    def test_cache_records_prepared_metadata_and_rejects_stale_cache(self) -> None:
+        manifest = self._write_manifest()
+        cache = self.root / "features.json"
+
+        bootstrap_matched_fmd(
+            manifest_path=manifest,
+            feature_cache_path=cache,
+            bootstrap_replicates=8,
+            bootstrap_seed=13,
+            feature_extractor=FakeExtractor(),
+            cache_provenance=TEST_PROVENANCE,
+        )
+
+        cache_data = json.loads(cache.read_text(encoding="utf-8"))
+        self.assertEqual(cache_data["schema_version"], FEATURE_CACHE_SCHEMA_VERSION)
+        self.assertEqual(cache_data["preparation"], FEATURE_PREPARATION_CONTRACT)
+        self.assertEqual(
+            cache_data["provenance"]["preparation"],
+            FEATURE_PREPARATION_CONTRACT,
+        )
+        self.assertEqual(cache_data["entry_count"], 16)
+        self.assertEqual(cache_data["unique_prepared_midi_hash_count"], 12)
+        self.assertEqual(len(cache_data["features"]), 16)
+        for entry in cache_data["features"].values():
+            self.assertEqual(set(entry["source"]), {"path", "sha256"})
+            self.assertEqual(entry["preparation"]["role"], entry["key"]["role"])
+            self.assertIn("role_contract", entry["preparation"])
+            self.assertRegex(entry["prepared_midi"]["sha256"], r"^[0-9a-f]{64}$")
+            self.assertIn("vector", entry)
+
+        stale_cache = json.loads(json.dumps(cache_data))
+        stale_cache["schema_version"] = 1
+        cache.write_text(json.dumps(stale_cache), encoding="utf-8")
+        with self.assertRaisesRegex(BootstrapFMDValidationError, "schema_version"):
+            bootstrap_matched_fmd(
+                manifest_path=manifest,
+                feature_cache_path=cache,
+                bootstrap_replicates=8,
+                bootstrap_seed=13,
+                feature_extractor=FailingExtractor(),
+                cache_provenance=TEST_PROVENANCE,
+            )
+
+        incompatible_cache = json.loads(json.dumps(cache_data))
+        incompatible_cache["preparation"]["generated"]["melody_track_names"] = [
+            "melody",
+            "lead",
+        ]
+        cache.write_text(json.dumps(incompatible_cache), encoding="utf-8")
+        with self.assertRaisesRegex(BootstrapFMDValidationError, "preparation"):
+            bootstrap_matched_fmd(
+                manifest_path=manifest,
+                feature_cache_path=cache,
+                bootstrap_replicates=8,
+                bootstrap_seed=13,
+                feature_extractor=FailingExtractor(),
+                cache_provenance=TEST_PROVENANCE,
+            )
 
     def test_expected_point_validation_passes_requires_complete_and_fails_closed(
         self,

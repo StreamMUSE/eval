@@ -23,6 +23,7 @@ matrix square roots.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib
 import importlib.metadata
@@ -30,8 +31,9 @@ import inspect
 import json
 import math
 import sys
+import tempfile
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,8 +47,41 @@ DEFAULT_GAUSSIAN_ESTIMATOR = "mle"
 DEFAULT_VALIDATION_ATOL = 1e-6
 DEFAULT_VALIDATION_RTOL = 1e-6
 OUTPUT_SCHEMA_VERSION = 1
-FEATURE_CACHE_SCHEMA_VERSION = 1
+FEATURE_CACHE_SCHEMA_VERSION = 2
 FEATURE_ROLES = ("generated", "groundtruth")
+OFFICIAL_FRECHET_MELODY_TRACK_NAMES = ("melody",)
+OFFICIAL_FRECHET_MELODY_PROGRAMS: tuple[int, ...] = ()
+OFFICIAL_FRECHET_MELODY_TRACK_INDICES: tuple[int, ...] = ()
+OFFICIAL_FRECHET_KEEP_MELODY = False
+OFFICIAL_FRECHET_INCLUDE_DRUMS = False
+OFFICIAL_FRECHET_GT_ACCOMPANIMENT_TRACK_NAMES = ("piano",)
+FEATURE_PREPARATION_CONTRACT: dict[str, Any] = {
+    "schema_version": 1,
+    "name": (
+        "evaluate_accompaniment_metrics._FrechetDatasetBuilder."
+        "accompaniment_only"
+    ),
+    "source": "evaluate_accompaniment_metrics.py::_FrechetDatasetBuilder.add_pair",
+    "generated": {
+        "helper": "_build_accompaniment_only_midi",
+        "melody_track_names": list(OFFICIAL_FRECHET_MELODY_TRACK_NAMES),
+        "melody_programs": list(OFFICIAL_FRECHET_MELODY_PROGRAMS),
+        "melody_track_indices": list(OFFICIAL_FRECHET_MELODY_TRACK_INDICES),
+        "keep_melody": OFFICIAL_FRECHET_KEEP_MELODY,
+        "include_drums": OFFICIAL_FRECHET_INCLUDE_DRUMS,
+        "melody_name_match": "case-insensitive exact name after strip/lower",
+    },
+    "groundtruth": {
+        "helper": "_build_ground_truth_accompaniment_midi",
+        "preferred_track_names": list(OFFICIAL_FRECHET_GT_ACCOMPANIMENT_TRACK_NAMES),
+        "fallback": "all non-drum instruments when no preferred track is present",
+        "include_drums": OFFICIAL_FRECHET_INCLUDE_DRUMS,
+    },
+    "write": {
+        "format": "temporary .mid passed to extract_feature",
+        "metadata": "copy.deepcopy(PrettyMIDI) then filter instruments before write",
+    },
+}
 
 
 class BootstrapFMDValidationError(ValueError):
@@ -91,16 +126,19 @@ class FeatureRequest:
     relative_path: str
     absolute_path: Path
     sha256: str
+    prepared_path: Path
+    prepared_sha256: str
+    preparation_contract: Mapping[str, Any]
 
     @property
-    def payload(self) -> dict[str, str]:
+    def payload(self) -> dict[str, Any]:
         return {
-            "system_id": self.system_id,
-            "piece_id": self.piece_id,
-            "seed": self.seed,
-            "role": self.role,
-            "relative_path": self.relative_path,
-            "sha256": self.sha256,
+            "key": self.key_payload,
+            "source": self.source_payload,
+            "preparation": copy.deepcopy(dict(self.preparation_contract)),
+            "prepared_midi": {
+                "sha256": self.prepared_sha256,
+            },
         }
 
     @property
@@ -113,13 +151,31 @@ class FeatureRequest:
         }
 
     @property
+    def source_payload(self) -> dict[str, str]:
+        return {
+            "path": self.relative_path,
+            "sha256": self.sha256,
+        }
+
+    @property
+    def source_id(self) -> str:
+        return _feature_source_id(
+            system_id=self.system_id,
+            piece_id=self.piece_id,
+            seed=self.seed,
+            role=self.role,
+            relative_path=self.relative_path,
+            sha256=self.sha256,
+        )
+
+    @property
     def entry_id(self) -> str:
         return hashlib.sha256(_canonical_json_bytes(self.payload)).hexdigest()
 
 
 @dataclass(frozen=True)
 class FeatureCacheResult:
-    vectors_by_entry_id: dict[str, np.ndarray]
+    vectors_by_source_id: dict[str, np.ndarray]
     provenance: dict[str, Any]
     cache_path: Path
     cache_sha256: str
@@ -153,6 +209,205 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _preparation_contract() -> dict[str, Any]:
+    return copy.deepcopy(FEATURE_PREPARATION_CONTRACT)
+
+
+def _preparation_contract_sha256() -> str:
+    return hashlib.sha256(_canonical_json_bytes(_preparation_contract())).hexdigest()
+
+
+def _role_preparation_contract(role: str) -> dict[str, Any]:
+    contract = _preparation_contract()
+    if role not in FEATURE_ROLES:
+        raise BootstrapFMDValidationError(f"unknown feature role: {role!r}")
+    return {
+        "schema_version": contract["schema_version"],
+        "name": contract["name"],
+        "source": contract["source"],
+        "role": role,
+        "role_contract": contract[role],
+        "write": contract["write"],
+    }
+
+
+def _feature_source_id(
+    *,
+    system_id: str,
+    piece_id: str,
+    seed: str,
+    role: str,
+    relative_path: str,
+    sha256: str,
+) -> str:
+    return hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "key": {
+                    "system_id": system_id,
+                    "piece_id": piece_id,
+                    "seed": seed,
+                    "role": role,
+                },
+                "source": {
+                    "path": relative_path,
+                    "sha256": sha256,
+                },
+            }
+        )
+    ).hexdigest()
+
+
+def _load_pretty_midi(path: Path, context: str) -> Any:
+    try:
+        import pretty_midi  # type: ignore
+    except ImportError as exc:
+        raise BootstrapFMDValidationError(
+            "pretty-midi package is required to prepare accompaniment-only FMD MIDI"
+        ) from exc
+    try:
+        return pretty_midi.PrettyMIDI(str(path))
+    except Exception as exc:
+        raise BootstrapFMDValidationError(
+            f"failed to load MIDI for {context}: {path}: {exc}"
+        ) from exc
+
+
+def _build_accompaniment_only_midi(
+    midi: Any,
+    melody_names: Iterable[str],
+    melody_programs: Iterable[int],
+    melody_indices: Iterable[int],
+    keep_melody: bool,
+    include_drums: bool,
+) -> Any:
+    """Return a deep-copied MIDI with melody and drums removed."""
+
+    midi_copy = copy.deepcopy(midi)
+    if keep_melody:
+        if include_drums:
+            return midi_copy
+        midi_copy.instruments = [
+            instrument
+            for instrument in midi_copy.instruments
+            if not instrument.is_drum
+        ]
+        return midi_copy
+
+    melody_name_set = {name.lower() for name in melody_names if name}
+    melody_program_set = set(melody_programs)
+    melody_index_set = set(melody_indices)
+
+    filtered: list[Any] = []
+    for index, instrument in enumerate(midi_copy.instruments):
+        if not include_drums and instrument.is_drum:
+            continue
+        name = (instrument.name or "").strip().lower()
+        is_melody = False
+        if melody_name_set and name and name in melody_name_set:
+            is_melody = True
+        if melody_program_set and instrument.program in melody_program_set:
+            is_melody = True
+        if melody_index_set and index in melody_index_set:
+            is_melody = True
+        if not is_melody:
+            filtered.append(instrument)
+    midi_copy.instruments = filtered
+    return midi_copy
+
+
+def _is_groundtruth_accompaniment_instrument(instrument: Any) -> bool:
+    name = (instrument.name or "").strip().lower()
+    return name in OFFICIAL_FRECHET_GT_ACCOMPANIMENT_TRACK_NAMES
+
+
+def _select_groundtruth_instruments(
+    midi: Any,
+    include_drums: bool,
+) -> tuple[list[Any], bool]:
+    available = [
+        instrument
+        for instrument in midi.instruments
+        if include_drums or not instrument.is_drum
+    ]
+    piano_tracks = [
+        instrument
+        for instrument in available
+        if _is_groundtruth_accompaniment_instrument(instrument)
+    ]
+    if piano_tracks:
+        return piano_tracks, True
+    return available, False
+
+
+def _build_groundtruth_accompaniment_midi(midi: Any, include_drums: bool) -> Any:
+    """Return a deep-copied MIDI keeping only GT accompaniment instruments."""
+
+    midi_copy = copy.deepcopy(midi)
+    selected, _ = _select_groundtruth_instruments(midi_copy, include_drums)
+    midi_copy.instruments = selected
+    return midi_copy
+
+
+def _prepared_feature_request(
+    *,
+    system_id: str,
+    piece_id: str,
+    seed: str,
+    role: str,
+    relative_path: str,
+    absolute_path: Path,
+    sha256: str,
+    temporary_root: Path,
+) -> FeatureRequest:
+    source_id = _feature_source_id(
+        system_id=system_id,
+        piece_id=piece_id,
+        seed=seed,
+        role=role,
+        relative_path=relative_path,
+        sha256=sha256,
+    )
+    prepared_path = temporary_root / role / f"{source_id}.mid"
+    prepared_path.parent.mkdir(parents=True, exist_ok=True)
+    context = f"{system_id}/{piece_id}/seed {seed}/{role}"
+    midi = _load_pretty_midi(absolute_path, context)
+    if role == "generated":
+        prepared_midi = _build_accompaniment_only_midi(
+            midi,
+            OFFICIAL_FRECHET_MELODY_TRACK_NAMES,
+            OFFICIAL_FRECHET_MELODY_PROGRAMS,
+            OFFICIAL_FRECHET_MELODY_TRACK_INDICES,
+            OFFICIAL_FRECHET_KEEP_MELODY,
+            OFFICIAL_FRECHET_INCLUDE_DRUMS,
+        )
+    elif role == "groundtruth":
+        prepared_midi = _build_groundtruth_accompaniment_midi(
+            midi,
+            OFFICIAL_FRECHET_INCLUDE_DRUMS,
+        )
+    else:
+        raise BootstrapFMDValidationError(f"unknown feature role: {role!r}")
+    try:
+        prepared_midi.write(str(prepared_path))
+    except Exception as exc:
+        raise BootstrapFMDValidationError(
+            f"failed to write prepared accompaniment-only MIDI for {context}: {exc}"
+        ) from exc
+    return FeatureRequest(
+        system_id=system_id,
+        piece_id=piece_id,
+        seed=seed,
+        role=role,
+        relative_path=relative_path,
+        absolute_path=absolute_path,
+        sha256=sha256,
+        prepared_path=prepared_path,
+        prepared_sha256=file_sha256(prepared_path),
+        preparation_contract=_role_preparation_contract(role),
+    )
 
 
 def _read_json(path: Path) -> Any:
@@ -520,6 +775,62 @@ def _checkpoint_identity(*, check_hash: bool) -> dict[str, Any]:
     return identity
 
 
+def _torch_deterministic_mode() -> dict[str, Any]:
+    try:
+        import torch  # type: ignore
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    identity: dict[str, Any] = {
+        "status": "available",
+        "torch_version": getattr(torch, "__version__", None),
+        "grad_enabled_at_provenance_capture": None,
+        "deterministic_algorithms_enabled": None,
+        "cudnn_deterministic": None,
+        "cudnn_benchmark": None,
+    }
+    try:
+        identity["grad_enabled_at_provenance_capture"] = bool(torch.is_grad_enabled())
+    except Exception:
+        pass
+    try:
+        identity["deterministic_algorithms_enabled"] = bool(
+            torch.are_deterministic_algorithms_enabled()
+        )
+    except Exception:
+        pass
+    cudnn = getattr(getattr(torch, "backends", None), "cudnn", None)
+    if cudnn is not None:
+        identity["cudnn_deterministic"] = getattr(cudnn, "deterministic", None)
+        identity["cudnn_benchmark"] = getattr(cudnn, "benchmark", None)
+    return identity
+
+
+def _extractor_runtime_mode(feature_extractor: object | None) -> dict[str, Any]:
+    model_training: bool | None = None
+    model_attribute: str | None = None
+    if feature_extractor is not None:
+        for attribute in ("_model", "model"):
+            model = getattr(feature_extractor, attribute, None)
+            if hasattr(model, "training"):
+                model_training = bool(getattr(model, "training"))
+                model_attribute = attribute
+                break
+    return {
+        "clamp2_model_eval_observed": (
+            None if model_training is None else not model_training
+        ),
+        "model_attribute": model_attribute,
+        "no_grad_contract": (
+            "frechet_music_distance CLaMP2Extractor._extract_feature is "
+            "decorated with torch.no_grad()"
+        ),
+        "torch": _torch_deterministic_mode(),
+    }
+
+
 def build_cache_provenance(
     feature_extractor: object | None = None,
     *,
@@ -543,7 +854,21 @@ def build_cache_provenance(
             "name": DEFAULT_GAUSSIAN_ESTIMATOR,
             "covariance": "np.cov(rowvar=False), unbiased n-1 normalization",
         },
+        "preparation": _preparation_contract(),
+        "preparation_contract_sha256": _preparation_contract_sha256(),
+        "deterministic_mode": _extractor_runtime_mode(feature_extractor),
     }
+
+
+def _normalize_cache_provenance(
+    provenance: Mapping[str, Any],
+    feature_extractor: object | None,
+) -> dict[str, Any]:
+    normalized = dict(provenance)
+    normalized["preparation"] = _preparation_contract()
+    normalized["preparation_contract_sha256"] = _preparation_contract_sha256()
+    normalized["deterministic_mode"] = _extractor_runtime_mode(feature_extractor)
+    return normalized
 
 
 def _nested_value(root: Mapping[str, Any], path: Sequence[str]) -> Any:
@@ -565,6 +890,16 @@ def _validate_cache_compatibility(
     if cached_name != DEFAULT_FEATURE_EXTRACTOR or current_name != DEFAULT_FEATURE_EXTRACTOR:
         raise BootstrapFMDValidationError(
             f"feature cache {cache_path} is not a CLAMP2 cache"
+        )
+    if cached.get("preparation") != current.get("preparation"):
+        raise BootstrapFMDValidationError(
+            f"feature cache {cache_path} preparation contract mismatch"
+        )
+    if cached.get("preparation_contract_sha256") != current.get(
+        "preparation_contract_sha256"
+    ):
+        raise BootstrapFMDValidationError(
+            f"feature cache {cache_path} preparation contract SHA256 mismatch"
         )
     comparisons = (
         (
@@ -607,11 +942,37 @@ def _load_cached_feature_entries(
     raw_features = cache_data.get("features")
     if not isinstance(raw_features, Mapping):
         raise BootstrapFMDValidationError(f"feature cache features must be an object: {cache_path}")
+    if cache_data.get("preparation") != _preparation_contract():
+        raise BootstrapFMDValidationError(
+            f"feature cache {cache_path} preparation contract mismatch"
+        )
+    if cache_data.get("preparation_contract_sha256") != _preparation_contract_sha256():
+        raise BootstrapFMDValidationError(
+            f"feature cache {cache_path} preparation contract SHA256 mismatch"
+        )
 
     cached_vectors: dict[str, np.ndarray] = {}
     requests_by_id = {request.entry_id: request for request in requests}
+    requests_by_source_id = {request.source_id: request for request in requests}
     for entry_id, raw_entry in raw_features.items():
         if entry_id not in requests_by_id:
+            if isinstance(raw_entry, Mapping):
+                raw_key = raw_entry.get("key")
+                raw_source = raw_entry.get("source")
+                if isinstance(raw_key, Mapping) and isinstance(raw_source, Mapping):
+                    raw_source_id = hashlib.sha256(
+                        _canonical_json_bytes(
+                            {
+                                "key": raw_key,
+                                "source": raw_source,
+                            }
+                        )
+                    ).hexdigest()
+                    if raw_source_id in requests_by_source_id:
+                        raise BootstrapFMDValidationError(
+                            f"{cache_path}: stale feature entry for current source "
+                            f"{raw_source_id} has incompatible preparation metadata"
+                        )
             continue
         context = f"{cache_path}: features[{entry_id!r}]"
         if not isinstance(raw_entry, Mapping):
@@ -619,12 +980,18 @@ def _load_cached_feature_entries(
         request = requests_by_id[entry_id]
         if raw_entry.get("key") != request.key_payload:
             raise BootstrapFMDValidationError(f"{context}.key does not match manifest")
-        if raw_entry.get("path") != request.relative_path:
-            raise BootstrapFMDValidationError(f"{context}.path does not match manifest")
-        if raw_entry.get("sha256") != request.sha256:
-            raise BootstrapFMDValidationError(f"{context}.sha256 does not match manifest")
+        if raw_entry.get("source") != request.source_payload:
+            raise BootstrapFMDValidationError(f"{context}.source does not match manifest")
+        if raw_entry.get("preparation") != request.preparation_contract:
+            raise BootstrapFMDValidationError(
+                f"{context}.preparation does not match current contract"
+            )
+        if raw_entry.get("prepared_midi") != {"sha256": request.prepared_sha256}:
+            raise BootstrapFMDValidationError(
+                f"{context}.prepared_midi does not match current prepared MIDI"
+            )
         vector = _coerce_feature_vector(raw_entry.get("vector"), f"{context}.vector")
-        cached_vectors[entry_id] = vector
+        cached_vectors[request.source_id] = vector
     return cached_vectors, dict(cached_provenance)
 
 
@@ -673,12 +1040,15 @@ def _extract_feature_vector(
     return _coerce_feature_vector(raw_vector, f"{context} feature")
 
 
-def _feature_requests(manifest: CommonValidManifest) -> tuple[FeatureRequest, ...]:
+def _feature_requests(
+    manifest: CommonValidManifest,
+    temporary_root: Path,
+) -> tuple[FeatureRequest, ...]:
     requests: list[FeatureRequest] = []
     for system_id in manifest.system_ids:
         for trial in manifest.trials_by_system[system_id]:
             requests.append(
-                FeatureRequest(
+                _prepared_feature_request(
                     system_id=trial.system_id,
                     piece_id=trial.piece_id,
                     seed=trial.seed,
@@ -686,10 +1056,11 @@ def _feature_requests(manifest: CommonValidManifest) -> tuple[FeatureRequest, ..
                     relative_path=trial.generated_relative_path,
                     absolute_path=trial.generated_path,
                     sha256=trial.generated_sha256,
+                    temporary_root=temporary_root,
                 )
             )
             requests.append(
-                FeatureRequest(
+                _prepared_feature_request(
                     system_id=trial.system_id,
                     piece_id=trial.piece_id,
                     seed=trial.seed,
@@ -697,6 +1068,7 @@ def _feature_requests(manifest: CommonValidManifest) -> tuple[FeatureRequest, ..
                     relative_path=trial.groundtruth_relative_path,
                     absolute_path=trial.groundtruth_path,
                     sha256=trial.groundtruth_sha256,
+                    temporary_root=temporary_root,
                 )
             )
     return tuple(requests)
@@ -713,104 +1085,121 @@ def load_or_extract_feature_cache(
     """Load cached CLAMP2 vectors and extract missing MIDI hashes once."""
 
     cache_path = cache_path.expanduser().resolve()
-    requests = _feature_requests(manifest)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     caller_injected_extractor = feature_extractor is not None
-    current_provenance = (
-        dict(cache_provenance)
-        if cache_provenance is not None
-        else build_cache_provenance(
-            feature_extractor,
-            caller_injected=caller_injected_extractor,
-        )
-    )
-    cached_vectors, cached_provenance = _load_cached_feature_entries(
-        cache_path,
-        requests,
-        current_provenance,
-    )
-    vectors_by_hash: dict[str, np.ndarray] = {}
-    for request in requests:
-        vector = cached_vectors.get(request.entry_id)
-        if vector is None:
-            continue
-        existing = vectors_by_hash.get(request.sha256)
-        if existing is not None and not np.array_equal(existing, vector):
-            raise BootstrapFMDValidationError(
-                f"feature cache has inconsistent vectors for SHA256 {request.sha256}"
-            )
-        vectors_by_hash[request.sha256] = vector
-
-    missing_by_hash: dict[str, FeatureRequest] = {}
-    for request in requests:
-        if request.sha256 not in vectors_by_hash:
-            missing_by_hash.setdefault(request.sha256, request)
-
-    if missing_by_hash:
-        if feature_extractor is None:
-            feature_extractor = _make_clamp2_extractor(verbose_extractor)
+    with tempfile.TemporaryDirectory(
+        prefix="bootstrap-matched-fmd-",
+        dir=cache_path.parent,
+    ) as temporary_name:
+        requests = _feature_requests(manifest, Path(temporary_name))
         current_provenance = (
-            dict(cache_provenance)
+            _normalize_cache_provenance(cache_provenance, feature_extractor)
             if cache_provenance is not None
             else build_cache_provenance(
                 feature_extractor,
                 caller_injected=caller_injected_extractor,
             )
         )
-        if cached_provenance is not None:
-            _validate_cache_compatibility(cached_provenance, current_provenance, cache_path)
-        for sha256, request in sorted(missing_by_hash.items()):
-            vectors_by_hash[sha256] = _extract_feature_vector(
-                feature_extractor,
-                request.absolute_path,
-                (
-                    f"{request.system_id}/{request.piece_id}/seed "
-                    f"{request.seed}/{request.role}"
-                ),
-            )
-    else:
-        if cached_provenance is not None:
-            current_provenance = cached_provenance
-
-    vectors_by_entry_id = {
-        request.entry_id: vectors_by_hash[request.sha256]
-        for request in requests
-    }
-    dimensions = {vector.shape[0] for vector in vectors_by_entry_id.values()}
-    if len(dimensions) != 1:
-        raise BootstrapFMDValidationError(
-            f"CLAMP2 feature dimensions differ across MIDI files: {sorted(dimensions)}"
+        cached_vectors, cached_provenance = _load_cached_feature_entries(
+            cache_path,
+            requests,
+            current_provenance,
         )
+        vectors_by_prepared_hash: dict[str, np.ndarray] = {}
+        for request in requests:
+            vector = cached_vectors.get(request.source_id)
+            if vector is None:
+                continue
+            existing = vectors_by_prepared_hash.get(request.prepared_sha256)
+            if existing is not None and not np.array_equal(existing, vector):
+                raise BootstrapFMDValidationError(
+                    "feature cache has inconsistent vectors for prepared MIDI "
+                    f"SHA256 {request.prepared_sha256}"
+                )
+            vectors_by_prepared_hash[request.prepared_sha256] = vector
 
-    feature_entries = {
-        request.entry_id: {
-            "key": request.key_payload,
-            "path": request.relative_path,
-            "sha256": request.sha256,
-            "vector": vectors_by_entry_id[request.entry_id].tolist(),
+        missing_by_hash: dict[str, FeatureRequest] = {}
+        for request in requests:
+            if request.prepared_sha256 not in vectors_by_prepared_hash:
+                missing_by_hash.setdefault(request.prepared_sha256, request)
+
+        if missing_by_hash:
+            if feature_extractor is None:
+                feature_extractor = _make_clamp2_extractor(verbose_extractor)
+            current_provenance = (
+                _normalize_cache_provenance(cache_provenance, feature_extractor)
+                if cache_provenance is not None
+                else build_cache_provenance(
+                    feature_extractor,
+                    caller_injected=caller_injected_extractor,
+                )
+            )
+            if cached_provenance is not None:
+                _validate_cache_compatibility(
+                    cached_provenance,
+                    current_provenance,
+                    cache_path,
+                )
+            for sha256, request in sorted(missing_by_hash.items()):
+                vectors_by_prepared_hash[sha256] = _extract_feature_vector(
+                    feature_extractor,
+                    request.prepared_path,
+                    (
+                        f"{request.system_id}/{request.piece_id}/seed "
+                        f"{request.seed}/{request.role} prepared accompaniment"
+                    ),
+                )
+        else:
+            if cached_provenance is not None:
+                current_provenance = dict(cached_provenance)
+
+        vectors_by_source_id = {
+            request.source_id: vectors_by_prepared_hash[request.prepared_sha256]
+            for request in requests
         }
-        for request in sorted(requests, key=lambda item: item.entry_id)
-    }
-    cache_payload = {
-        "schema_version": FEATURE_CACHE_SCHEMA_VERSION,
-        "producer": "eval_toolkit.bootstrap_matched_fmd",
-        "manifest": {
-            "path": str(manifest.path),
-            "sha256": manifest.sha256,
-        },
-        "entry_count": len(feature_entries),
-        "unique_midi_hash_count": len(vectors_by_hash),
-        "provenance": current_provenance,
-        "features": feature_entries,
-    }
-    _write_json_atomic(cache_path, cache_payload)
+        dimensions = {vector.shape[0] for vector in vectors_by_source_id.values()}
+        if len(dimensions) != 1:
+            raise BootstrapFMDValidationError(
+                "CLAMP2 feature dimensions differ across MIDI files: "
+                f"{sorted(dimensions)}"
+            )
+
+        feature_entries = {
+            request.entry_id: {
+                "key": request.key_payload,
+                "source": request.source_payload,
+                "preparation": copy.deepcopy(dict(request.preparation_contract)),
+                "prepared_midi": {
+                    "sha256": request.prepared_sha256,
+                },
+                "vector": vectors_by_source_id[request.source_id].tolist(),
+            }
+            for request in sorted(requests, key=lambda item: item.entry_id)
+        }
+        cache_payload = {
+            "schema_version": FEATURE_CACHE_SCHEMA_VERSION,
+            "producer": "eval_toolkit.bootstrap_matched_fmd",
+            "manifest": {
+                "path": str(manifest.path),
+                "sha256": manifest.sha256,
+            },
+            "entry_count": len(feature_entries),
+            "unique_midi_hash_count": len(vectors_by_prepared_hash),
+            "unique_prepared_midi_hash_count": len(vectors_by_prepared_hash),
+            "preparation": _preparation_contract(),
+            "preparation_contract_sha256": _preparation_contract_sha256(),
+            "provenance": current_provenance,
+            "features": feature_entries,
+        }
+        _write_json_atomic(cache_path, cache_payload)
 
     return FeatureCacheResult(
-        vectors_by_entry_id=vectors_by_entry_id,
+        vectors_by_source_id=vectors_by_source_id,
         provenance=current_provenance,
         cache_path=cache_path,
         cache_sha256=file_sha256(cache_path),
         entry_count=len(feature_entries),
-        unique_midi_hash_count=len(vectors_by_hash),
+        unique_midi_hash_count=len(vectors_by_prepared_hash),
         cache_hits=len(cached_vectors),
         cache_misses=len(requests) - len(cached_vectors),
         extracted_midi_count=len(missing_by_hash),
@@ -952,27 +1341,25 @@ def _system_feature_matrices(
     generated_rows: list[np.ndarray] = []
     groundtruth_rows: list[np.ndarray] = []
     for trial in manifest.trials_by_system[system_id]:
-        generated_request = FeatureRequest(
+        generated_source_id = _feature_source_id(
             system_id=trial.system_id,
             piece_id=trial.piece_id,
             seed=trial.seed,
             role="generated",
             relative_path=trial.generated_relative_path,
-            absolute_path=trial.generated_path,
             sha256=trial.generated_sha256,
         )
-        groundtruth_request = FeatureRequest(
+        groundtruth_source_id = _feature_source_id(
             system_id=trial.system_id,
             piece_id=trial.piece_id,
             seed=trial.seed,
             role="groundtruth",
             relative_path=trial.groundtruth_relative_path,
-            absolute_path=trial.groundtruth_path,
             sha256=trial.groundtruth_sha256,
         )
-        generated_rows.append(feature_cache.vectors_by_entry_id[generated_request.entry_id])
+        generated_rows.append(feature_cache.vectors_by_source_id[generated_source_id])
         groundtruth_rows.append(
-            feature_cache.vectors_by_entry_id[groundtruth_request.entry_id]
+            feature_cache.vectors_by_source_id[groundtruth_source_id]
         )
     return np.vstack(generated_rows), np.vstack(groundtruth_rows)
 
@@ -1234,6 +1621,7 @@ def bootstrap_matched_fmd(
         "feature_cache_sha256": feature_cache.cache_sha256,
         "entry_count": feature_cache.entry_count,
         "unique_midi_hash_count": feature_cache.unique_midi_hash_count,
+        "unique_prepared_midi_hash_count": feature_cache.unique_midi_hash_count,
         "cache_hits": feature_cache.cache_hits,
         "cache_misses": feature_cache.cache_misses,
         "extracted_midi_count": feature_cache.extracted_midi_count,
@@ -1253,8 +1641,10 @@ def bootstrap_matched_fmd(
             "gaussian_estimator": DEFAULT_GAUSSIAN_ESTIMATOR,
             "official_point_estimate_compatibility": (
                 "frechet_music_distance score(reference_dir, test_dir) "
-                "with np.cov(rowvar=False)"
+                "with evaluate_accompaniment_metrics accompaniment-only MIDI "
+                "preparation and np.cov(rowvar=False)"
             ),
+            "input_preparation": _preparation_contract(),
         },
         "bootstrap": {
             "method": "matched_piece_cluster_percentile",
