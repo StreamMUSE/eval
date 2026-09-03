@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from eval_toolkit.materialize_common_valid_music_eval import (
     CommonValidMaterializationError,
+    PUBLISH_RENAME_INITIAL_BACKOFF_SECONDS,
+    PUBLISH_RENAME_MAX_ATTEMPTS,
     materialize_common_valid_music_eval,
 )
 
@@ -247,6 +249,72 @@ class MaterializeCommonValidMusicEvalTest(unittest.TestCase):
                 )
         self.assertFalse(output.exists())
         self.assertEqual(list(self.root.glob(".copy-failure.staging-*")), [])
+
+    def test_retries_transient_permission_errors_during_atomic_publish(self) -> None:
+        audit = self._write_audit()
+        original_rename = Path.rename
+
+        for transient_failures in (1, 3):
+            with self.subTest(transient_failures=transient_failures):
+                output = self.root / f"rename-retry-{transient_failures}"
+                failures_remaining = transient_failures
+
+                def flaky_rename(path: Path, target: Path) -> Path:
+                    nonlocal failures_remaining
+                    if failures_remaining:
+                        failures_remaining -= 1
+                        raise PermissionError(5, "transient publish lock")
+                    return original_rename(path, target)
+
+                with mock.patch.object(
+                    Path, "rename", autospec=True, side_effect=flaky_rename
+                ) as rename_mock, mock.patch(
+                    "eval_toolkit.materialize_common_valid_music_eval.time.sleep"
+                ) as sleep_mock:
+                    materialize_common_valid_music_eval(
+                        audit_path=audit,
+                        system_ids=self.SYSTEMS,
+                        output_dir=output,
+                    )
+
+                self.assertTrue(output.is_dir())
+                self.assertEqual(rename_mock.call_count, transient_failures + 1)
+                self.assertEqual(
+                    [call.args[0] for call in sleep_mock.call_args_list],
+                    [
+                        PUBLISH_RENAME_INITIAL_BACKOFF_SECONDS * (2**attempt)
+                        for attempt in range(transient_failures)
+                    ],
+                )
+
+    def test_persistent_publish_permission_error_is_not_swallowed(self) -> None:
+        audit = self._write_audit()
+        output = self.root / "persistent-rename-failure"
+
+        with mock.patch.object(
+            Path,
+            "rename",
+            autospec=True,
+            side_effect=PermissionError(5, "persistent publish lock"),
+        ) as rename_mock, mock.patch(
+            "eval_toolkit.materialize_common_valid_music_eval.time.sleep"
+        ) as sleep_mock:
+            with self.assertRaises(PermissionError):
+                materialize_common_valid_music_eval(
+                    audit_path=audit,
+                    system_ids=self.SYSTEMS,
+                    output_dir=output,
+                )
+
+        self.assertEqual(rename_mock.call_count, PUBLISH_RENAME_MAX_ATTEMPTS)
+        self.assertEqual(
+            sleep_mock.call_count,
+            PUBLISH_RENAME_MAX_ATTEMPTS - 1,
+        )
+        self.assertFalse(output.exists())
+        self.assertEqual(
+            list(self.root.glob(".persistent-rename-failure.staging-*")), []
+        )
 
 
 if __name__ == "__main__":

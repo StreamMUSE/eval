@@ -9,6 +9,7 @@ import json
 import re
 import shutil
 import sys
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -39,6 +40,8 @@ CSV_FIELDS = (
     "common_generated_midi",
     "common_metric_gt_midi",
 )
+PUBLISH_RENAME_MAX_ATTEMPTS = 5
+PUBLISH_RENAME_INITIAL_BACKOFF_SECONDS = 0.05
 
 
 class CommonValidMaterializationError(ValueError):
@@ -358,6 +361,23 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _publish_staging_directory(staging: Path, output_dir: Path) -> None:
+    delay = PUBLISH_RENAME_INITIAL_BACKOFF_SECONDS
+    for attempt in range(PUBLISH_RENAME_MAX_ATTEMPTS):
+        if output_dir.exists():
+            raise CommonValidMaterializationError(
+                f"output directory appeared during publication: {output_dir}"
+            )
+        try:
+            staging.rename(output_dir)
+            return
+        except PermissionError:
+            if attempt + 1 == PUBLISH_RENAME_MAX_ATTEMPTS:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
 def materialize_common_valid_music_eval(
     *,
     audit_path: Path,
@@ -468,11 +488,7 @@ def materialize_common_valid_music_eval(
         _write_json(staging / "manifest.json", manifest)
         _write_csv(staging / "manifest.csv", flat_rows)
 
-        if output_dir.exists():
-            raise CommonValidMaterializationError(
-                f"output directory appeared during publication: {output_dir}"
-            )
-        staging.rename(output_dir)
+        _publish_staging_directory(staging, output_dir)
         return manifest
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
