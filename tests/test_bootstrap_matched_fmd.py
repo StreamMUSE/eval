@@ -8,6 +8,7 @@ import unittest
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import scipy.linalg
@@ -20,6 +21,7 @@ from eval_toolkit.bootstrap_matched_fmd import (
     frechet_distance_from_precomputed,
     frechet_distance_low_rank,
     load_common_valid_manifest,
+    main,
     precompute_sample_space_fmd,
 )
 
@@ -209,7 +211,6 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
 
         first = bootstrap_matched_fmd(
             manifest_path=manifest,
-            output_json=output,
             feature_cache_path=cache,
             bootstrap_replicates=40,
             bootstrap_seed=5,
@@ -217,7 +218,7 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
             cache_provenance=TEST_PROVENANCE,
         )
 
-        self.assertTrue(output.is_file())
+        self.assertFalse(output.exists())
         self.assertTrue(cache.is_file())
         expected_hash_counts = Counter({digest: 1 for digest in self._unique_hashes(manifest)})
         self.assertEqual(Counter(extractor.calls), expected_hash_counts)
@@ -244,18 +245,41 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
             self.assertLessEqual(result["ci"]["low"], result["ci"]["high"])
             self.assertEqual(result["validation"]["status"], "not_supplied")
 
+        expected = {
+            system_id: first["systems"][system_id]["estimate"]
+            for system_id in self.SYSTEMS
+        }
+        published = bootstrap_matched_fmd(
+            manifest_path=manifest,
+            output_json=output,
+            feature_cache_path=cache,
+            bootstrap_replicates=40,
+            bootstrap_seed=5,
+            expected_points=expected,
+            feature_extractor=FailingExtractor(),
+            cache_provenance=TEST_PROVENANCE,
+        )
+        self.assertTrue(output.is_file())
+        for system_id in self.SYSTEMS:
+            self.assertEqual(
+                published["systems"][system_id]["validation"]["status"],
+                "passed",
+            )
+
         second = bootstrap_matched_fmd(
             manifest_path=manifest,
             output_json=self.root / "fmd-second.json",
             feature_cache_path=cache,
             bootstrap_replicates=40,
             bootstrap_seed=5,
+            expected_points=expected,
             feature_extractor=FailingExtractor(),
             cache_provenance=TEST_PROVENANCE,
         )
 
-        self.assertEqual(first["bootstrap"], second["bootstrap"])
-        self.assertEqual(first["systems"], second["systems"])
+        self.assertEqual(published["bootstrap"], second["bootstrap"])
+        self.assertEqual(published["systems"], second["systems"])
+        self.assertEqual(published["cache_provenance"]["cache_hits"], 16)
         self.assertEqual(second["cache_provenance"]["cache_hits"], 16)
         self.assertEqual(second["cache_provenance"]["extracted_midi_count"], 0)
 
@@ -264,6 +288,37 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
     ) -> None:
         manifest = self._write_manifest()
         cache = self.root / "features.json"
+        unvalidated_output = self.root / "unvalidated.json"
+        unvalidated_cache = self.root / "unvalidated-cache.json"
+        with self.assertRaisesRegex(BootstrapFMDValidationError, "requires"):
+            bootstrap_matched_fmd(
+                manifest_path=manifest,
+                output_json=unvalidated_output,
+                feature_cache_path=unvalidated_cache,
+                bootstrap_replicates=10,
+                bootstrap_seed=7,
+                feature_extractor=FailingExtractor(),
+                cache_provenance=TEST_PROVENANCE,
+            )
+        self.assertFalse(unvalidated_output.exists())
+        self.assertFalse(unvalidated_cache.exists())
+
+        incomplete_output = self.root / "incomplete-expected.json"
+        incomplete_cache = self.root / "incomplete-cache.json"
+        with self.assertRaisesRegex(BootstrapFMDValidationError, "exactly one"):
+            bootstrap_matched_fmd(
+                manifest_path=manifest,
+                output_json=incomplete_output,
+                feature_cache_path=incomplete_cache,
+                bootstrap_replicates=10,
+                bootstrap_seed=7,
+                expected_points={self.SYSTEMS[0]: 0.0},
+                feature_extractor=FailingExtractor(),
+                cache_provenance=TEST_PROVENANCE,
+            )
+        self.assertFalse(incomplete_output.exists())
+        self.assertFalse(incomplete_cache.exists())
+
         baseline = bootstrap_matched_fmd(
             manifest_path=manifest,
             feature_cache_path=cache,
@@ -289,20 +344,6 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
         )
         self.assertEqual(passed["validation"]["status"], "passed")
 
-        missing_output = self.root / "missing-expected.json"
-        with self.assertRaisesRegex(BootstrapFMDValidationError, "exactly one"):
-            bootstrap_matched_fmd(
-                manifest_path=manifest,
-                output_json=missing_output,
-                feature_cache_path=cache,
-                bootstrap_replicates=10,
-                bootstrap_seed=7,
-                expected_points={self.SYSTEMS[0]: expected[self.SYSTEMS[0]]},
-                feature_extractor=FailingExtractor(),
-                cache_provenance=TEST_PROVENANCE,
-            )
-        self.assertFalse(missing_output.exists())
-
         bad_expected = dict(expected)
         bad_expected[self.SYSTEMS[0]] += 1.0
         bad_output = self.root / "bad-expected.json"
@@ -320,6 +361,96 @@ class BootstrapMatchedFMDTest(unittest.TestCase):
                 cache_provenance=TEST_PROVENANCE,
             )
         self.assertFalse(bad_output.exists())
+
+    def test_cli_refuses_unvalidated_publish_before_cache_or_extraction(self) -> None:
+        manifest = self._write_manifest()
+        output = self.root / "cli-unvalidated.json"
+        cache = self.root / "cli-cache.json"
+
+        exit_code = main(
+            [
+                "--manifest",
+                str(manifest),
+                "--output-json",
+                str(output),
+                "--feature-cache",
+                str(cache),
+                "--bootstrap-replicates",
+                "10",
+            ]
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(output.exists())
+        self.assertFalse(cache.exists())
+
+    def test_default_extractor_provenance_hashes_checkpoint_when_obtainable(
+        self,
+    ) -> None:
+        manifest = self._write_manifest()
+        checkpoint_calls: list[bool] = []
+        identity_calls: list[bool] = []
+
+        def checkpoint_identity(*, check_hash: bool) -> dict[str, object]:
+            checkpoint_calls.append(check_hash)
+            return {
+                "name": "weights.pth",
+                "path": str(self.root / "weights.pth"),
+                "url": "https://example.invalid/weights.pth",
+                "exists": True,
+                "sha256": "c" * 64 if check_hash else None,
+                "status": "hashed" if check_hash else "present_not_hashed",
+            }
+
+        def extractor_identity(
+            feature_extractor: object | None,
+            *,
+            injected: bool,
+        ) -> dict[str, object]:
+            identity_calls.append(injected)
+            class_path = (
+                "default.CLaMP2Extractor"
+                if feature_extractor is None
+                else "default.CreatedCLaMP2Extractor"
+            )
+            return {
+                "name": "clamp2",
+                "class_path": class_path,
+                "module_file": None,
+                "injected": injected,
+            }
+
+        with mock.patch(
+            "eval_toolkit.bootstrap_matched_fmd._make_clamp2_extractor",
+            return_value=FakeExtractor(),
+        ), mock.patch(
+            "eval_toolkit.bootstrap_matched_fmd._checkpoint_identity",
+            side_effect=checkpoint_identity,
+        ), mock.patch(
+            "eval_toolkit.bootstrap_matched_fmd._extractor_identity",
+            side_effect=extractor_identity,
+        ), mock.patch(
+            "eval_toolkit.bootstrap_matched_fmd._distribution_version",
+            return_value="1.0.0-test",
+        ), mock.patch(
+            "eval_toolkit.bootstrap_matched_fmd._module_file",
+            return_value=None,
+        ):
+            summary = bootstrap_matched_fmd(
+                manifest_path=manifest,
+                feature_cache_path=self.root / "default-cache.json",
+                bootstrap_replicates=5,
+                bootstrap_seed=3,
+            )
+
+        provenance = summary["cache_provenance"]["provenance"]
+        self.assertFalse(provenance["feature_extractor"]["injected"])
+        self.assertEqual(provenance["checkpoint"]["status"], "hashed")
+        self.assertEqual(provenance["checkpoint"]["sha256"], "c" * 64)
+        self.assertTrue(checkpoint_calls)
+        self.assertTrue(all(checkpoint_calls))
+        self.assertTrue(identity_calls)
+        self.assertFalse(any(identity_calls))
 
     def test_manifest_validation_is_strict(self) -> None:
         def remove_one_system_key(payload: dict[str, object], _root: Path) -> None:

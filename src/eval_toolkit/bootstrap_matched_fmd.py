@@ -445,7 +445,11 @@ def _distribution_version(name: str) -> str | None:
         return None
 
 
-def _extractor_identity(feature_extractor: object | None) -> dict[str, Any]:
+def _extractor_identity(
+    feature_extractor: object | None,
+    *,
+    injected: bool,
+) -> dict[str, Any]:
     if feature_extractor is not None:
         extractor_class = feature_extractor.__class__
         try:
@@ -458,7 +462,7 @@ def _extractor_identity(feature_extractor: object | None) -> dict[str, Any]:
                 f"{extractor_class.__module__}.{extractor_class.__qualname__}"
             ),
             "module_file": str(Path(source_file).resolve()) if source_file else None,
-            "injected": True,
+            "injected": injected,
         }
     try:
         from frechet_music_distance.models.clamp2.clamp2_extractor import (  # type: ignore
@@ -516,17 +520,25 @@ def _checkpoint_identity(*, check_hash: bool) -> dict[str, Any]:
     return identity
 
 
-def build_cache_provenance(feature_extractor: object | None = None) -> dict[str, Any]:
+def build_cache_provenance(
+    feature_extractor: object | None = None,
+    *,
+    caller_injected: bool | None = None,
+) -> dict[str, Any]:
     """Return extractor/package/checkpoint provenance for cache auditing."""
 
-    injected = feature_extractor is not None
+    if caller_injected is None:
+        caller_injected = feature_extractor is not None
     return {
         "frechet_music_distance": {
             "package_version": _distribution_version("frechet-music-distance"),
             "module_file": _module_file("frechet_music_distance"),
         },
-        "feature_extractor": _extractor_identity(feature_extractor),
-        "checkpoint": _checkpoint_identity(check_hash=not injected),
+        "feature_extractor": _extractor_identity(
+            feature_extractor,
+            injected=caller_injected,
+        ),
+        "checkpoint": _checkpoint_identity(check_hash=not caller_injected),
         "gaussian_estimator": {
             "name": DEFAULT_GAUSSIAN_ESTIMATOR,
             "covariance": "np.cov(rowvar=False), unbiased n-1 normalization",
@@ -702,10 +714,14 @@ def load_or_extract_feature_cache(
 
     cache_path = cache_path.expanduser().resolve()
     requests = _feature_requests(manifest)
+    caller_injected_extractor = feature_extractor is not None
     current_provenance = (
         dict(cache_provenance)
         if cache_provenance is not None
-        else build_cache_provenance(feature_extractor)
+        else build_cache_provenance(
+            feature_extractor,
+            caller_injected=caller_injected_extractor,
+        )
     )
     cached_vectors, cached_provenance = _load_cached_feature_entries(
         cache_path,
@@ -735,7 +751,10 @@ def load_or_extract_feature_cache(
         current_provenance = (
             dict(cache_provenance)
             if cache_provenance is not None
-            else build_cache_provenance(feature_extractor)
+            else build_cache_provenance(
+                feature_extractor,
+                caller_injected=caller_injected_extractor,
+            )
         )
         if cached_provenance is not None:
             _validate_cache_compatibility(cached_provenance, current_provenance, cache_path)
@@ -1066,8 +1085,14 @@ def _validation_report(
 def _validate_expected_point_coverage(
     expected_points: Mapping[str, float],
     system_ids: Sequence[str],
+    *,
+    require_expected_points: bool,
 ) -> None:
     if not expected_points:
+        if require_expected_points:
+            raise BootstrapFMDValidationError(
+                "output_json publication requires --expected-point for every system"
+            )
         return
     expected_system_ids = set(expected_points)
     actual_system_ids = set(system_ids)
@@ -1109,7 +1134,11 @@ def bootstrap_matched_fmd(
             "common-valid manifest must contain at least two keys for FMD"
         )
     expected_points = expected_points or {}
-    _validate_expected_point_coverage(expected_points, manifest.system_ids)
+    _validate_expected_point_coverage(
+        expected_points,
+        manifest.system_ids,
+        require_expected_points=output_json is not None,
+    )
     if feature_cache_path is None:
         feature_cache_path = manifest.root / "clamp2_feature_cache.json"
 
