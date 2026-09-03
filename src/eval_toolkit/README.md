@@ -233,6 +233,18 @@ end time while ignoring velocity; a false value does not block publication.
 Metric-ready GT is always rebuilt from the cohort, never from offline
 round-trip MIDI.
 
+Materialize the exact common-valid intersection before matched music metrics.
+Every system in the audit must be listed; validation failure leaves no output:
+
+```bash
+PYTHONPATH=src python -m eval_toolkit.materialize_common_valid_music_eval \
+  --audit results/matched_music/audit.csv \
+  --system-id beat_gt_offline \
+  --system-id streammuse_v1_standard \
+  --system-id streammuse_v2_prompt_continuation \
+  --output-dir results/matched_music_common_valid
+```
+
 For formal matched metrics, evaluate every valid-only system with fixed 12 s
 onset and duration domains:
 
